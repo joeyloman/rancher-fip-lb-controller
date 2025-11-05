@@ -73,6 +73,14 @@ metadata:
     rancher.k8s.binbash.org/static-ip: "<ip-address>"
 ```
 
+To request a specific floatingIPPool for a `LoadBalancer` service, add the following annotation to your service manifest:
+
+```yaml
+metadata:
+  annotations:
+    rancher.k8s.binbash.org/network: "<floatingIPPool-name>"
+```
+
 The controller will add the following annotations and labels to the service after requesting the floating IP:
 
 - Annotation `rancher.k8s.binbash.org/floatingip`: The allocated floating IP address.

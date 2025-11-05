@@ -234,11 +234,20 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 					r.ipamClient = ipamClient
 				}
 
+				// Determine the floating IP pool name
+				staticNetworkName := svc.Annotations["rancher.k8s.binbash.org/static-network"]
+				fipPoolName := staticNetworkName
+				if fipPoolName == "" {
+					fipPoolName = string(secret.Data["floatingIPPool"])
+				} else {
+					logrus.Infof("Found request for static network %s for service %s/%s", fipPoolName, svc.Namespace, svc.Name)
+				}
+
 				err = r.ipamClient.ReleaseFIP(
 					string(secret.Data["clientSecret"]),
 					string(secret.Data["cluster"]),
 					string(secret.Data["project"]),
-					string(secret.Data["floatingIPPool"]),
+					fipPoolName,
 					svc.Namespace,
 					svc.Name,
 					ipAddress,
@@ -384,11 +393,19 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 	}
 
 	// Look up the network interface
-	networkInterface, ok := configMap.Data[string(secret.Data["floatingIPPool"])]
-	if !ok {
-		return fmt.Errorf("no network interface found for floating ip pool %s", string(secret.Data["floatingIPPool"]))
+	staticNetworkName := svc.Annotations["rancher.k8s.binbash.org/static-network"]
+	fipPoolName := staticNetworkName
+	if fipPoolName == "" {
+		fipPoolName = string(secret.Data["floatingIPPool"])
+	} else {
+		logrus.Infof("Found request for static network %s for service %s/%s", fipPoolName, svc.Namespace, svc.Name)
 	}
-	logrus.Infof("Found network interface %s for floating ip pool %s", networkInterface, string(secret.Data["floatingIPPool"]))
+
+	networkInterface, ok := configMap.Data[fipPoolName]
+	if !ok {
+		return fmt.Errorf("no network interface found for floating ip pool %s", fipPoolName)
+	}
+	logrus.Infof("Found network interface %s for floating ip pool %s", networkInterface, fipPoolName)
 
 	// Check if a static IP is given in the service annotations
 	ipAddress = svc.Annotations["rancher.k8s.binbash.org/static-ip"]
@@ -414,7 +431,7 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 		string(secret.Data["clientSecret"]),
 		string(secret.Data["cluster"]),
 		string(secret.Data["project"]),
-		string(secret.Data["floatingIPPool"]),
+		fipPoolName,
 		svc.Namespace,
 		svc.Name,
 		ipAddress,
@@ -486,7 +503,7 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 								string(secret.Data["clientSecret"]),
 								string(secret.Data["cluster"]),
 								string(secret.Data["project"]),
-								string(secret.Data["floatingIPPool"]),
+								fipPoolName,
 								svc.Namespace,
 								svc.Name,
 								allocatedIPAddress,
@@ -513,7 +530,7 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 				string(secret.Data["clientSecret"]),
 				string(secret.Data["cluster"]),
 				string(secret.Data["project"]),
-				string(secret.Data["floatingIPPool"]),
+				fipPoolName,
 				svc.Namespace,
 				svc.Name,
 				allocatedIPAddress,
@@ -545,7 +562,7 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 			string(secret.Data["clientSecret"]),
 			string(secret.Data["cluster"]),
 			string(secret.Data["project"]),
-			string(secret.Data["floatingIPPool"]),
+			fipPoolName,
 			svc.Namespace,
 			svc.Name,
 			allocatedIPAddress,
@@ -647,7 +664,7 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 			string(secret.Data["clientSecret"]),
 			string(secret.Data["cluster"]),
 			string(secret.Data["project"]),
-			string(secret.Data["floatingIPPool"]),
+			fipPoolName,
 			svc.Namespace,
 			svc.Name,
 			allocatedIPAddress,
