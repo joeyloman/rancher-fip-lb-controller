@@ -425,6 +425,11 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 			r.recorder.Eventf(svc, v1.EventTypeWarning, "QuotaExceeded", "Failed to request FloatingIP for Service Load Balancer: quota exceeded for project %s", string(secret.Data["project"]))
 			return nil
 		}
+		if strings.Contains(err.Error(), "denied the request") {
+			logrus.Errorf("%s", err)
+			r.recorder.Eventf(svc, v1.EventTypeWarning, "RequestDenied", "Failed to request FloatingIP for Service Load Balancer: request denied for project %s", string(secret.Data["project"]))
+			return nil
+		}
 		return fmt.Errorf("failed to request FIP: %w", err)
 	}
 	logrus.Infof("Successfully requested FIP %s", allocatedIPAddress)
