@@ -245,7 +245,7 @@ func startHttpServer(ctx context.Context, clientset *kubernetes.Clientset, appNa
 		logrus.Fatalf("failed to create ipam client: %s", err)
 	}
 
-	httpServer := http.NewServer(ipamClient, clientSecret, cluster, project, floatingIPPools, username, password)
+	httpServer := http.NewServer(ipamClient, clientset, clientSecret, cluster, project, floatingIPPools, username, password)
 	go httpServer.Start(httpServerPort)
 
 	return nil

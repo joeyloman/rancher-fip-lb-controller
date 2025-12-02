@@ -12,7 +12,6 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - services
   - namespaces
   - secrets
   - configmaps
@@ -21,6 +20,17 @@ rules:
   - list
   - watch
   - update
+  - patch
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - get
+  - list
+  - watch
+  - update
+  - delete
   - patch
 - apiGroups:
   - ""

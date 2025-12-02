@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/joeyloman/rancher-fip-lb-controller/pkg/ipam"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 func newTestServer(handler http.HandlerFunc) *httptest.Server {
@@ -37,7 +38,8 @@ func TestHandleFIPList(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	server := NewServer(ipamClient, "secret", "cluster", "project", []string{"pool1"}, "testuser", "testpassword")
+	clientset := fake.NewSimpleClientset()
+	server := NewServer(ipamClient, clientset, "secret", "cluster", "project", []string{"pool1"}, "testuser", "testpassword")
 
 	req, err := http.NewRequest("GET", "/", nil)
 	if err != nil {
@@ -78,7 +80,8 @@ func TestHandleRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	server := NewServer(ipamClient, "secret", "cluster", "project", []string{"pool1"}, "testuser", "testpassword")
+	clientset := fake.NewSimpleClientset()
+	server := NewServer(ipamClient, clientset, "secret", "cluster", "project", []string{"pool1"}, "testuser", "testpassword")
 
 	formValues := "project=p&cluster=c&floatingippool=f&servicenamespace=s&servicename=s&ipaddr=1.2.3.4"
 	req, err := http.NewRequest("POST", "/release", strings.NewReader(formValues))
@@ -115,7 +118,8 @@ func TestHandleRemove(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	server := NewServer(ipamClient, "secret", "cluster", "project", []string{"pool1"}, "testuser", "testpassword")
+	clientset := fake.NewSimpleClientset()
+	server := NewServer(ipamClient, clientset, "secret", "cluster", "project", []string{"pool1"}, "testuser", "testpassword")
 
 	formValues := "project=p&ipaddr=1.2.3.4"
 	req, err := http.NewRequest("POST", "/remove", strings.NewReader(formValues))
@@ -145,7 +149,8 @@ func TestHandleFIPList_IPAMError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	server := NewServer(ipamClient, "secret", "cluster", "project", []string{"pool1"}, "testuser", "testpassword")
+	clientset := fake.NewSimpleClientset()
+	server := NewServer(ipamClient, clientset, "secret", "cluster", "project", []string{"pool1"}, "testuser", "testpassword")
 
 	req, err := http.NewRequest("GET", "/", nil)
 	if err != nil {
@@ -163,7 +168,8 @@ func TestHandleFIPList_IPAMError(t *testing.T) {
 }
 
 func TestHandleRelease_FormError(t *testing.T) {
-	server := NewServer(nil, "secret", "cluster", "project", []string{"pool1"}, "testuser", "testpassword")
+	clientset := fake.NewSimpleClientset()
+	server := NewServer(nil, clientset, "secret", "cluster", "project", []string{"pool1"}, "testuser", "testpassword")
 
 	req, err := http.NewRequest("POST", "/release", strings.NewReader("project=p"))
 	if err != nil {
@@ -182,7 +188,8 @@ func TestHandleRelease_FormError(t *testing.T) {
 }
 
 func TestHandleRemove_FormError(t *testing.T) {
-	server := NewServer(nil, "secret", "cluster", "project", []string{"pool1"}, "testuser", "testpassword")
+	clientset := fake.NewSimpleClientset()
+	server := NewServer(nil, clientset, "secret", "cluster", "project", []string{"pool1"}, "testuser", "testpassword")
 
 	req, err := http.NewRequest("POST", "/remove", strings.NewReader("ipaddr=1.2.3.4"))
 	if err != nil {

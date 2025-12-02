@@ -1,6 +1,7 @@
 package http
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -12,10 +13,14 @@ import (
 
 	"github.com/joeyloman/rancher-fip-lb-controller/pkg/ipam"
 	"github.com/sirupsen/logrus"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 )
 
 type Server struct {
 	ipamClient      *ipam.Client
+	clientset       kubernetes.Interface
 	clientSecret    string
 	cluster         string
 	project         string
@@ -26,9 +31,10 @@ type Server struct {
 	sessionsMutex   sync.Mutex
 }
 
-func NewServer(ipamClient *ipam.Client, clientSecret, cluster, project string, floatingIPPools []string, username, password string) *Server {
+func NewServer(ipamClient *ipam.Client, clientset kubernetes.Interface, clientSecret, cluster, project string, floatingIPPools []string, username, password string) *Server {
 	return &Server{
 		ipamClient:      ipamClient,
+		clientset:       clientset,
 		clientSecret:    clientSecret,
 		cluster:         cluster,
 		project:         project,
@@ -221,8 +227,6 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The `ReleaseFIP` function requires more parameters than the `DeleteFIP` function.
-	// For now we will call the `DeleteFIP` for both actions until `ReleaseFIP` is updated.
 	project := r.FormValue("project")
 	cluster := r.FormValue("cluster")
 	floatingippool := r.FormValue("floatingippool")
@@ -259,7 +263,30 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 
 	logrus.Infof("Releasing FIP %s from project %s", ipaddr, project)
 
+	// First try to delete the service first if it exists, so it will release the FIP automatically
+	ctx := context.Background()
+	_, err := s.clientset.CoreV1().Services(servicenamespace).Get(ctx, servicename, metav1.GetOptions{})
+	if err == nil {
+		// Service exists, delete it
+		logrus.Infof("Service %s/%s exists, deleting it to release FIP", servicenamespace, servicename)
+		err = s.clientset.CoreV1().Services(servicenamespace).Delete(ctx, servicename, metav1.DeleteOptions{})
+		if err != nil {
+			logrus.Errorf("failed to delete service %s/%s: %s", servicenamespace, servicename, err)
+			http.Error(w, fmt.Sprintf("failed to delete service %s/%s: %s", servicenamespace, servicename, err), http.StatusInternalServerError)
+			return
+		}
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	} else if !errors.IsNotFound(err) {
+		logrus.Errorf("failed to check if service %s/%s exists: %s", servicenamespace, servicename, err)
+		http.Error(w, fmt.Sprintf("failed to check if service %s/%s exists: %s", servicenamespace, servicename, err), http.StatusInternalServerError)
+		return
+	} else {
+		logrus.Infof("Service %s/%s does not exist, releasing FIP", servicenamespace, servicename)
+	}
+
 	if err := s.ipamClient.ReleaseFIP(s.clientSecret, cluster, project, floatingippool, servicenamespace, servicename, ipaddr); err != nil {
+		logrus.Errorf("failed to release fip: %s", err)
 		http.Error(w, fmt.Sprintf("failed to release fip: %s", err), http.StatusInternalServerError)
 		return
 	}
@@ -308,6 +335,7 @@ func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) {
 	logrus.Infof("Removing FIP %s from project %s", ipaddr, project)
 
 	if err := s.ipamClient.DeleteFIP(s.clientSecret, project, ipaddr); err != nil {
+		logrus.Errorf("failed to remove fip: %s", err)
 		http.Error(w, fmt.Sprintf("failed to remove fip: %s", err), http.StatusInternalServerError)
 		return
 	}
