@@ -396,13 +396,6 @@ const fipListTemplate = `
         </tr>
         {{end}}
     </table>
-	<p>
-	<b>WARNING:</b><br>
-	This web application let you manage all FloatingIPs of all clusters which are assigned to the same project this cluster it a part of.
-	You could harm other clusters if you are not careful!<br>
-	The proper way to release a FloatingIP from a cluster is to just delete the Service (Load Balancer) object inside the cluster.
-	If that is not possible, you can use this web application to release the FloatingIP and remove it from the project.
-	</p>
 </body>
 </html>
 `
