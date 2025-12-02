@@ -8,7 +8,6 @@ import (
 
 	"github.com/joeyloman/rancher-fip-lb-controller/pkg/ipam"
 	"github.com/joeyloman/rancher-fip-lb-controller/pkg/metallb"
-	"github.com/rancher/lasso/pkg/log"
 	"github.com/sirupsen/logrus"
 	"go.universe.tf/metallb/api/v1beta1"
 	v1 "k8s.io/api/core/v1"
@@ -174,10 +173,12 @@ func (r *reconciler) getProjectIDFromAppNamespace() (string, error) {
 func (r *reconciler) reconcile(svc *v1.Service) error {
 	var ipAddress string
 
-	logrus.WithFields(logrus.Fields{
+	logger := logrus.WithFields(logrus.Fields{
 		"service":    fmt.Sprintf("%s/%s", svc.Namespace, svc.Name),
 		"serviceUID": svc.UID,
 	})
+
+	logger.Info("Reconciling Service")
 
 	// Handle service deletion
 	if svc.ObjectMeta.DeletionTimestamp != nil {
@@ -192,7 +193,7 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 			var ok bool
 			projectId, ok = ns.Labels["field.cattle.io/projectId"]
 			if !ok {
-				logrus.Infof("Service namespace %s does not have a project ID label, checking if the cluster is part of a project", svc.Namespace)
+				logger.Infof("Service namespace %s does not have a project ID label, checking if the cluster is part of a project", svc.Namespace)
 
 				var err error
 				projectId, err = r.getProjectIDFromAppNamespace()
@@ -209,7 +210,7 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 			secret, err := r.clientset.CoreV1().Secrets(r.appNamespace).Get(context.Background(), secretName, metav1.GetOptions{})
 			if err != nil {
 				if errors.IsNotFound(err) {
-					logrus.Warnf("Secret %s not found in namespace %s, skipping", secretName, r.appNamespace)
+					logger.Warnf("Secret %s not found in namespace %s, skipping", secretName, r.appNamespace)
 					return nil
 				}
 				return fmt.Errorf("failed to get secret %s: %w", secretName, err)
@@ -240,7 +241,7 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 				if fipPoolName == "" {
 					fipPoolName = string(secret.Data["floatingIPPool"])
 				} else {
-					logrus.Infof("Found request for static network %s for service %s/%s", fipPoolName, svc.Namespace, svc.Name)
+					logger.Infof("Found request for static network %s for service %s/%s", fipPoolName, svc.Namespace, svc.Name)
 				}
 
 				err = r.ipamClient.ReleaseFIP(
@@ -282,14 +283,14 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 						return true, nil
 					}
 
-					logrus.Warnf("Failed to remove floatingip annotation from service %s/%s, will retry: %v", currentSvc.Namespace, currentSvc.Name, err)
+					logger.Warnf("Failed to remove floatingip annotation from service %s/%s, will retry: %v", currentSvc.Namespace, currentSvc.Name, err)
 					return false, nil
 				})
 				if err != nil {
 					return fmt.Errorf("failed to remove floatingip annotation from service %s/%s: %w", svc.Namespace, svc.Name, err)
 				}
 
-				logrus.Infof("Successfully released FIP %s", ipAddress)
+				logger.Infof("Successfully released FIP %s", ipAddress)
 			}
 
 			// Delete MetalLB resources
@@ -321,7 +322,7 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 				currentSvc.ObjectMeta.Finalizers = removeString(currentSvc.ObjectMeta.Finalizers, finalizerName)
 				_, err = r.clientset.CoreV1().Services(currentSvc.Namespace).Update(context.Background(), currentSvc, metav1.UpdateOptions{})
 				if err != nil {
-					logrus.Warnf("Failed to remove finalizer from service %s/%s, will retry: %v", currentSvc.Namespace, currentSvc.Name, err)
+					logger.Warnf("Failed to remove finalizer from service %s/%s, will retry: %v", currentSvc.Namespace, currentSvc.Name, err)
 					// Return false, nil to continue polling.
 					return false, nil
 				}
@@ -337,11 +338,9 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 		return nil
 	}
 
-	logrus.Infof("Reconciling Service")
-
 	// Check if the service already has a load balancer IP
 	if len(svc.Status.LoadBalancer.Ingress) > 0 {
-		logrus.Infof("Service %s/%s already has a load balancer IP, skipping", svc.Namespace, svc.Name)
+		logger.Infof("Service %s/%s already has a load balancer IP, skipping", svc.Namespace, svc.Name)
 		return nil
 	}
 
@@ -355,7 +354,7 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 	var ok bool
 	projectId, ok = ns.Labels["field.cattle.io/projectId"]
 	if !ok {
-		logrus.Infof("Service namespace %s does not have a project ID label, checking if the cluster is part of a project", svc.Namespace)
+		logger.Infof("Service namespace %s does not have a project ID label, checking if the cluster is part of a project", svc.Namespace)
 
 		var err error
 		projectId, err = r.getProjectIDFromAppNamespace()
@@ -367,21 +366,21 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 		}
 	}
 
-	logrus.WithField("projectID", projectId)
-	logrus.Infof("Service is in project")
+	logger = logger.WithField("projectID", projectId)
+	logger.Infof("Service is in project")
 
 	// Construct the secret name and get the secret
 	secretName := fmt.Sprintf("rancher-fip-config-%s", projectId)
 	secret, err := r.clientset.CoreV1().Secrets(r.appNamespace).Get(context.Background(), secretName, metav1.GetOptions{})
 	if err != nil {
 		if errors.IsNotFound(err) {
-			logrus.Warnf("Secret %s not found in namespace %s, skipping", secretName, r.appNamespace)
+			logger.Warnf("Secret %s not found in namespace %s, skipping", secretName, r.appNamespace)
 			return nil
 		}
 		return fmt.Errorf("failed to get secret %s: %w", secretName, err)
 	}
 
-	logrus.Infof("Successfully fetched secret %s", secret.Name)
+	logger.Infof("Successfully fetched secret %s", secret.Name)
 
 	// Generate a client ID
 	clientId := fmt.Sprintf("client-%s", string(secret.Data["cluster"]))
@@ -398,19 +397,19 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 	if fipPoolName == "" {
 		fipPoolName = string(secret.Data["floatingIPPool"])
 	} else {
-		logrus.Infof("Found request for static network %s for service %s/%s", fipPoolName, svc.Namespace, svc.Name)
+		logger.Infof("Found request for static network %s for service %s/%s", fipPoolName, svc.Namespace, svc.Name)
 	}
 
 	networkInterface, ok := configMap.Data[fipPoolName]
 	if !ok {
 		return fmt.Errorf("no network interface found for floating ip pool %s", fipPoolName)
 	}
-	logrus.Infof("Found network interface %s for floating ip pool %s", networkInterface, fipPoolName)
+	logger.Infof("Found network interface %s for floating ip pool %s", networkInterface, fipPoolName)
 
 	// Check if a static IP is given in the service annotations
 	ipAddress = svc.Annotations["rancher.k8s.binbash.org/static-ip"]
 	if ipAddress != "" {
-		logrus.Infof("Found request for static IP %s for service %s/%s", ipAddress, svc.Namespace, svc.Name)
+		logger.Infof("Found request for static IP %s for service %s/%s", ipAddress, svc.Namespace, svc.Name)
 	}
 
 	// Create a new IPAM client
@@ -438,18 +437,18 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 	)
 	if err != nil {
 		if strings.Contains(err.Error(), "quota exceeded") {
-			logrus.Infof("failed to request FIP: quota exceeded for project %s service %s/%s, skipping", string(secret.Data["project"]), svc.Namespace, svc.Name)
+			logger.Infof("failed to request FIP: quota exceeded for project %s service %s/%s, skipping", string(secret.Data["project"]), svc.Namespace, svc.Name)
 			r.recorder.Eventf(svc, v1.EventTypeWarning, "QuotaExceeded", "Failed to request FloatingIP for Service Load Balancer: quota exceeded for project %s", string(secret.Data["project"]))
 			return nil
 		}
 		if strings.Contains(err.Error(), "denied the request") {
-			logrus.Errorf("%s", err)
+			logger.Errorf("%s", err)
 			r.recorder.Eventf(svc, v1.EventTypeWarning, "RequestDenied", "Failed to request FloatingIP for Service Load Balancer: request denied for project %s", string(secret.Data["project"]))
 			return nil
 		}
 		return fmt.Errorf("failed to request FIP: %w", err)
 	}
-	logrus.Infof("Successfully requested FIP %s", allocatedIPAddress)
+	logger.Infof("Successfully requested FIP %s", allocatedIPAddress)
 
 	// Create MetalLB resources
 	poolName := fmt.Sprintf("rancher-fip-%s-%s", svc.Namespace, svc.Name)
@@ -479,7 +478,7 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 	if err := r.metallbClient.CreateIPAddressPool(context.Background(), ipAddressPool); err != nil && !errors.IsAlreadyExists(err) {
 		// if an IP is already a part of an existing IPAddressPool, it was not properly released, so we need to clean things up and try again
 		if strings.Contains(err.Error(), "overlaps with already defined CIDR") {
-			logrus.Warnf("IP %s is already a part of an existing MetalLBIPAddressPool, trying to clean things up and try again", allocatedIPAddress)
+			logger.Warnf("IP %s is already a part of an existing MetalLBIPAddressPool, trying to clean things up and try again", allocatedIPAddress)
 			// get all IPAddressPools, loop through them and identify the CIDR that overlaps
 			ipAddressPools, err := r.metallbClient.GetIPAddressPools(context.Background(), r.appNamespace)
 			if err != nil {
@@ -488,14 +487,14 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 			for _, p := range ipAddressPools {
 				for _, a := range p.Spec.Addresses {
 					if a == fmt.Sprintf("%s/32", allocatedIPAddress) {
-						logrus.Infof("CIDR %s/32 found in MetalLB IPAddressPool %s/%s, removing the old L2Advertisement and IPAddressPool", allocatedIPAddress, p.Namespace, p.Name)
+						logger.Infof("CIDR %s/32 found in MetalLB IPAddressPool %s/%s, removing the old L2Advertisement and IPAddressPool", allocatedIPAddress, p.Namespace, p.Name)
 						var releaseFIP bool = false
 						if err := r.metallbClient.DeleteL2Advertisement(context.Background(), p.Name, r.appNamespace); err != nil {
-							logrus.Errorf("failed to delete L2Advertisement: %s", err)
+							logger.Errorf("failed to delete L2Advertisement: %s", err)
 							releaseFIP = true
 						}
 						if err := r.metallbClient.DeleteIPAddressPool(context.Background(), p.Name, r.appNamespace); err != nil {
-							logrus.Errorf("failed to delete IPAddressPool: %s", err)
+							logger.Errorf("failed to delete IPAddressPool: %s", err)
 							releaseFIP = true
 						}
 						if releaseFIP {
@@ -513,19 +512,19 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 							}
 							return fmt.Errorf("failed to create IPAddressPool: %w", err)
 						}
-						logrus.Infof("Successfully deleted the old MetalLB L2Advertisement and IPAddressPool %s/%s, trying to create a new one", r.appNamespace, ipAddressPool.Name)
+						logger.Infof("Successfully deleted the old MetalLB L2Advertisement and IPAddressPool %s/%s, trying to create a new one", r.appNamespace, ipAddressPool.Name)
 
 						// Retry the creation of the IPAddressPool
 						if err := r.metallbClient.CreateIPAddressPool(context.Background(), ipAddressPool); err != nil && !errors.IsAlreadyExists(err) {
 							return fmt.Errorf("failed to create IPAddressPool: %w", err)
 						}
-						logrus.Infof("Successfully created IPAddressPool %s/%s", r.appNamespace, poolName)
+						logger.Infof("Successfully created IPAddressPool %s/%s", r.appNamespace, poolName)
 						break
 					}
 				}
 			}
 		} else {
-			log.Errorf("Failed to create MetalLB IPAddressPool: %s, releasing the FloatingIP", err)
+			logger.Errorf("Failed to create MetalLB IPAddressPool: %s, releasing the FloatingIP", err)
 			errRelease := r.ipamClient.ReleaseFIP(
 				string(secret.Data["clientSecret"]),
 				string(secret.Data["cluster"]),
@@ -553,7 +552,7 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 		},
 	}
 	if err := r.metallbClient.CreateL2Advertisement(context.Background(), l2Advertisement); err != nil && !errors.IsAlreadyExists(err) {
-		log.Errorf("Failed to create MetalLB L2Advertisement: %s, cleaning up and releasing the FloatingIP", err)
+		logger.Errorf("Failed to create MetalLB L2Advertisement: %s, cleaning up and releasing the FloatingIP", err)
 		errDelete := r.metallbClient.DeleteIPAddressPool(context.Background(), poolName, r.appNamespace)
 		if errDelete != nil {
 			return fmt.Errorf("failed to delete IPAddressPool during CreateL2Advertisement cleanup: %v, original error: %w", errDelete, err)
@@ -579,7 +578,7 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 		currentSvc, err := r.clientset.CoreV1().Services(svc.Namespace).Get(context.Background(), svc.Name, metav1.GetOptions{})
 		if err != nil {
 			if errors.IsNotFound(err) {
-				logrus.Debugf("Service '%s/%s' in work queue no longer exists", svc.Namespace, svc.Name)
+				logger.Debugf("Service '%s/%s' in work queue no longer exists", svc.Namespace, svc.Name)
 				return true, nil
 			}
 			return false, err
@@ -644,7 +643,7 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 		}
 
 		if errors.IsConflict(err) {
-			logrus.Info("Service modified, retrying to add finalizer, label and annotation")
+			logger.Info("Service modified, retrying to add finalizer, label and annotation")
 			return false, nil
 		}
 
