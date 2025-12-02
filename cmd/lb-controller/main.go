@@ -15,7 +15,6 @@ import (
 	"github.com/joeyloman/rancher-fip-lb-controller/pkg/ipam"
 	"github.com/joeyloman/rancher-fip-lb-controller/pkg/metallb"
 	"github.com/joeyloman/rancher-fip-lb-controller/pkg/util"
-	"github.com/rancher/lasso/pkg/log"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -160,7 +159,7 @@ func run(ctx context.Context, clientset *kubernetes.Clientset, metallbClient *me
 
 	if httpServerEnabled {
 		if err := startHttpServer(ctx, clientset, appNamespace, caCertData, httpServerPort); err != nil {
-			log.Errorf("failed to start HTTP server: %s", err)
+			logrus.Errorf("failed to start HTTP server: %s", err)
 		}
 	}
 
@@ -177,7 +176,9 @@ func startHttpServer(ctx context.Context, clientset *kubernetes.Clientset, appNa
 
 	projectId, ok := appNs.Labels["rancher.k8s.binbash.org/project-name"]
 	if !ok {
-		return fmt.Errorf("namespace %s does not have a project ID label 'rancher.k8s.binbash.org/project-name'", appNamespace)
+		// This is not an error, it just means that the HTTP server will not be started because it's not part of a project (bare-metal cluster)
+		logrus.Warnf("namespace %s does not have a project ID label 'rancher.k8s.binbash.org/project-name', aborting HTTP server", appNamespace)
+		return nil
 	}
 
 	// generate username and password for http basic auth
@@ -185,7 +186,7 @@ func startHttpServer(ctx context.Context, clientset *kubernetes.Clientset, appNa
 	httpAuthSecret, err := clientset.CoreV1().Secrets(appNamespace).Get(ctx, httpAuthSecretName, metav1.GetOptions{})
 	if err != nil {
 		if errors.IsNotFound(err) {
-			log.Infof("HTTP auth secret %s not found, creating it", httpAuthSecretName)
+			logrus.Infof("HTTP auth secret %s not found, creating it", httpAuthSecretName)
 
 			username, err := util.GenerateRandomString(10)
 			if err != nil {
