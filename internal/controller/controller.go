@@ -164,7 +164,7 @@ func (r *reconciler) getProjectIDFromAppNamespace() (string, error) {
 	}
 	projectId, ok := appNs.Labels["rancher.k8s.binbash.org/project-name"]
 	if !ok {
-		logrus.Infof("Namespace %s does not have a project ID label, skipping", r.appNamespace)
+		logrus.Debugf("Application namespace %s does not have a project ID label, this is not a virtual cluster", r.appNamespace)
 		return "", nil
 	}
 	return projectId, nil
@@ -172,6 +172,8 @@ func (r *reconciler) getProjectIDFromAppNamespace() (string, error) {
 
 func (r *reconciler) reconcile(svc *v1.Service) error {
 	var ipAddress string
+	var projectId string
+	var ok bool
 
 	logger := logrus.WithFields(logrus.Fields{
 		"service":    fmt.Sprintf("%s/%s", svc.Namespace, svc.Name),
@@ -189,18 +191,15 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 			}
 
 			// Check if the namespace if part of a project, if not check if the cluster is part of a project
-			var projectId string
-			var ok bool
-			projectId, ok = ns.Labels["field.cattle.io/projectId"]
-			if !ok {
-				logger.Infof("Service namespace %s does not have a project ID label, checking if the cluster is part of a project", svc.Namespace)
+			projectId, err = r.getProjectIDFromAppNamespace()
+			if err != nil {
+				return err
+			}
+			if projectId == "" {
+				projectId, ok = ns.Labels["field.cattle.io/projectId"]
+				if !ok {
+					logger.Infof("Service namespace %s does not have a project ID label, skipping FloatingIP request", svc.Namespace)
 
-				var err error
-				projectId, err = r.getProjectIDFromAppNamespace()
-				if err != nil {
-					return err
-				}
-				if projectId == "" {
 					return nil
 				}
 			}
@@ -210,7 +209,7 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 			secret, err := r.clientset.CoreV1().Secrets(r.appNamespace).Get(context.Background(), secretName, metav1.GetOptions{})
 			if err != nil {
 				if errors.IsNotFound(err) {
-					logger.Warnf("Secret %s not found in namespace %s, skipping", secretName, r.appNamespace)
+					logger.Warnf("Secret %s not found in namespace %s, skipping FloatingIP request", secretName, r.appNamespace)
 					return nil
 				}
 				return fmt.Errorf("failed to get secret %s: %w", secretName, err)
@@ -340,7 +339,7 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 
 	// Check if the service already has a load balancer IP
 	if len(svc.Status.LoadBalancer.Ingress) > 0 {
-		logger.Infof("Service %s/%s already has a load balancer IP, skipping", svc.Namespace, svc.Name)
+		logger.Infof("Service %s/%s already has a load balancer IP, skipping FloatingIP request", svc.Namespace, svc.Name)
 		return nil
 	}
 
@@ -350,18 +349,15 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 	}
 
 	// Check if the namespace if part of a project, if not check if the cluster is part of a project
-	var projectId string
-	var ok bool
-	projectId, ok = ns.Labels["field.cattle.io/projectId"]
-	if !ok {
-		logger.Infof("Service namespace %s does not have a project ID label, checking if the cluster is part of a project", svc.Namespace)
+	projectId, err = r.getProjectIDFromAppNamespace()
+	if err != nil {
+		return err
+	}
+	if projectId == "" {
+		projectId, ok = ns.Labels["field.cattle.io/projectId"]
+		if !ok {
+			logger.Infof("Service namespace %s does not have a project ID label, skipping FloatingIP request", svc.Namespace)
 
-		var err error
-		projectId, err = r.getProjectIDFromAppNamespace()
-		if err != nil {
-			return err
-		}
-		if projectId == "" {
 			return nil
 		}
 	}
@@ -374,7 +370,7 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 	secret, err := r.clientset.CoreV1().Secrets(r.appNamespace).Get(context.Background(), secretName, metav1.GetOptions{})
 	if err != nil {
 		if errors.IsNotFound(err) {
-			logger.Warnf("Secret %s not found in namespace %s, skipping", secretName, r.appNamespace)
+			logger.Warnf("Secret %s not found in namespace %s, skipping FloatingIP request", secretName, r.appNamespace)
 			return nil
 		}
 		return fmt.Errorf("failed to get secret %s: %w", secretName, err)
