@@ -135,10 +135,10 @@ func (c *Client) getToken() (string, error) {
 }
 
 // RequestFIP requests a floating IP address from the IPAM API.
-func (c *Client) RequestFIP(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) (string, error) {
+func (c *Client) RequestFIP(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) (string, string, error) {
 	token, err := c.getToken()
 	if err != nil {
-		return "", fmt.Errorf("failed to get token for FIP request: %w", err)
+		return "", "", fmt.Errorf("failed to get token for FIP request: %w", err)
 	}
 
 	reqBody := map[string]string{
@@ -152,26 +152,26 @@ func (c *Client) RequestFIP(clientSecret, cluster, project, floatingIPPool, serv
 	}
 	jsonBody, err := json.Marshal(reqBody)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal FIP request body: %w", err)
+		return "", "", fmt.Errorf("failed to marshal FIP request body: %w", err)
 	}
 
 	url := fmt.Sprintf("%s/fip/request", c.apiURL)
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonBody))
 	if err != nil {
-		return "", fmt.Errorf("failed to create FIP request: %w", err)
+		return "", "", fmt.Errorf("failed to create FIP request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("failed to request FIP: %w", err)
+		return "", "", fmt.Errorf("failed to request FIP: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("failed to read FIP response body: %w", err)
+		return "", "", fmt.Errorf("failed to read FIP response body: %w", err)
 	}
 
 	var fipResponse struct {
@@ -184,46 +184,47 @@ func (c *Client) RequestFIP(clientSecret, cluster, project, floatingIPPool, serv
 		ServiceNamespace string `json:"servicenamespace"`
 		ServiceName      string `json:"servicename"`
 		IPAddress        string `json:"ipaddr"`
+		Subnet           string `json:"subnet"`
 	}
 	if err := json.Unmarshal(body, &fipResponse); err != nil {
-		return "", fmt.Errorf("failed to unmarshal FIP response: %w", err)
+		return "", "", fmt.Errorf("failed to unmarshal FIP response: %w", err)
 	}
 
 	// check for errors
 	if resp.StatusCode != http.StatusOK {
 		if strings.Contains(string(body), "quota exceeded") {
-			return "", fmt.Errorf("failed to request FIP: quota exceeded")
+			return "", "", fmt.Errorf("failed to request FIP: quota exceeded")
 		}
-		return "", fmt.Errorf("failed to request FIP: status code %d (%s)", resp.StatusCode, string(body))
+		return "", "", fmt.Errorf("failed to request FIP: status code %d (%s)", resp.StatusCode, string(body))
 	}
 
 	// do some validation checks
 	if fipResponse.ClientSecret != clientSecret {
-		return "", fmt.Errorf("failed to request FIP: client secret mismatch")
+		return "", "", fmt.Errorf("failed to request FIP: client secret mismatch")
 	}
 	if fipResponse.Status != "approved" {
-		return "", fmt.Errorf("failed to request FIP: status %s", fipResponse.Status)
+		return "", "", fmt.Errorf("failed to request FIP: status %s", fipResponse.Status)
 	}
 	if fipResponse.Cluster != cluster {
-		return "", fmt.Errorf("failed to request FIP: cluster mismatch")
+		return "", "", fmt.Errorf("failed to request FIP: cluster mismatch")
 	}
 	if fipResponse.Project != project {
-		return "", fmt.Errorf("failed to request FIP: project mismatch")
+		return "", "", fmt.Errorf("failed to request FIP: project mismatch")
 	}
 	if fipResponse.FloatingIPPool != floatingIPPool {
-		return "", fmt.Errorf("failed to request FIP: floating IP pool mismatch")
+		return "", "", fmt.Errorf("failed to request FIP: floating IP pool mismatch")
 	}
 	if fipResponse.ServiceNamespace != serviceNamespace {
-		return "", fmt.Errorf("failed to request FIP: service namespace mismatch")
+		return "", "", fmt.Errorf("failed to request FIP: service namespace mismatch")
 	}
 	if fipResponse.ServiceName != serviceName {
-		return "", fmt.Errorf("failed to request FIP: service name mismatch")
+		return "", "", fmt.Errorf("failed to request FIP: service name mismatch")
 	}
 	if fipResponse.IPAddress == "" {
-		return "", fmt.Errorf("failed to request FIP: IP address is empty")
+		return "", "", fmt.Errorf("failed to request FIP: IP address is empty")
 	}
 
-	return fipResponse.IPAddress, nil
+	return fipResponse.IPAddress, fipResponse.Subnet, nil
 }
 
 // ReleaseFIP releases a floating IP address via the IPAM API.

@@ -14,6 +14,7 @@ import (
 	"github.com/joeyloman/rancher-fip-lb-controller/pkg/http"
 	"github.com/joeyloman/rancher-fip-lb-controller/pkg/ipam"
 	"github.com/joeyloman/rancher-fip-lb-controller/pkg/metallb"
+	"github.com/joeyloman/rancher-fip-lb-controller/pkg/purelb"
 	"github.com/joeyloman/rancher-fip-lb-controller/pkg/util"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
@@ -110,8 +111,13 @@ func main() {
 		logrus.Fatalf("Failed to create MetalLB client: %v", metallbErr)
 	}
 
+	purelbClient, purelbErr := purelb.NewClient(config)
+	if purelbErr != nil {
+		logrus.Fatalf("Failed to create PureLB client: %v", purelbErr)
+	}
+
 	if !leaderElect {
-		run(ctx, clientset, metallbClient, appNamespace, caCertData, httpServerPort)
+		run(ctx, clientset, metallbClient, purelbClient, appNamespace, caCertData, httpServerPort)
 		logrus.Info("Controller finished")
 		return
 	}
@@ -137,7 +143,7 @@ func main() {
 		RetryPeriod:     2 * time.Second,
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
-				run(ctx, clientset, metallbClient, appNamespace, caCertData, httpServerPort)
+				run(ctx, clientset, metallbClient, purelbClient, appNamespace, caCertData, httpServerPort)
 			},
 			OnStoppedLeading: func() {
 				logrus.Infof("leader lost: %s", id)
@@ -154,7 +160,7 @@ func main() {
 	})
 }
 
-func run(ctx context.Context, clientset *kubernetes.Clientset, metallbClient *metallb.Client, appNamespace string, caCertData []byte, httpServerPort int) {
+func run(ctx context.Context, clientset *kubernetes.Clientset, metallbClient *metallb.Client, purelbClient *purelb.Client, appNamespace string, caCertData []byte, httpServerPort int) {
 	logrus.Info("Starting rancher-fip-lb-controller")
 
 	if httpServerEnabled {
@@ -163,7 +169,7 @@ func run(ctx context.Context, clientset *kubernetes.Clientset, metallbClient *me
 		}
 	}
 
-	c := controller.New(clientset, metallbClient, appNamespace, caCertData)
+	c := controller.New(clientset, metallbClient, purelbClient, appNamespace, caCertData)
 	c.Run(ctx, 1)
 }
 

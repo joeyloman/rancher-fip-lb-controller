@@ -90,7 +90,7 @@ func TestRequestFIP(t *testing.T) {
 		},
 	}
 
-	ip, err := client.RequestFIP("secret", "cluster", "project", "pool", "ns", "service", "")
+	ip, _, err := client.RequestFIP("secret", "cluster", "project", "pool", "ns", "service", "")
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)
 	}
@@ -111,7 +111,7 @@ func TestRequestFIPFailures(t *testing.T) {
 	client1.httpClient.Transport = &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
-	_, err := client1.RequestFIP("secret", "cluster", "project", "pool", "ns", "service", "")
+	_, _, err := client1.RequestFIP("secret", "cluster", "project", "pool", "ns", "service", "")
 	if err == nil {
 		t.Error("expected an error for token failure, got nil")
 	}
@@ -130,7 +130,7 @@ func TestRequestFIPFailures(t *testing.T) {
 	client2.httpClient.Transport = &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
-	_, err = client2.RequestFIP("secret", "cluster", "project", "pool", "ns", "service", "")
+	_, _, err = client2.RequestFIP("secret", "cluster", "project", "pool", "ns", "service", "")
 	if err == nil {
 		t.Error("expected an error for non-200 response, got nil")
 	}
@@ -149,7 +149,7 @@ func TestRequestFIPFailures(t *testing.T) {
 	client3.httpClient.Transport = &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
-	_, err = client3.RequestFIP("secret", "cluster", "project", "pool", "ns", "service", "")
+	_, _, err = client3.RequestFIP("secret", "cluster", "project", "pool", "ns", "service", "")
 	if err == nil {
 		t.Error("expected an error for malformed JSON, got nil")
 	}
@@ -181,7 +181,7 @@ func TestRequestFIPFailures(t *testing.T) {
 	client4.httpClient.Transport = &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
-	_, err = client4.RequestFIP("secret", "cluster", "project", "pool", "ns", "service", "")
+	_, _, err = client4.RequestFIP("secret", "cluster", "project", "pool", "ns", "service", "")
 	if err == nil {
 		t.Error("expected an error for field mismatch, got nil")
 	}

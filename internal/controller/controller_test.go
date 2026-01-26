@@ -16,11 +16,11 @@ import (
 
 // MockIPAMClient is a mock of the IPAM client
 type MockIPAMClient struct {
-	RequestFIPFunc func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) (string, error)
+	RequestFIPFunc func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) (string, string, error)
 	ReleaseFIPFunc func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) error
 }
 
-func (m *MockIPAMClient) RequestFIP(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) (string, error) {
+func (m *MockIPAMClient) RequestFIP(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) (string, string, error) {
 	return m.RequestFIPFunc(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr)
 }
 
@@ -63,8 +63,8 @@ func TestController_reconcile(t *testing.T) {
 	recorder := record.NewFakeRecorder(10)
 
 	mockIPAM := &MockIPAMClient{
-		RequestFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) (string, error) {
-			return "1.2.3.4", nil
+		RequestFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) (string, string, error) {
+			return "1.2.3.4", "1.2.3.4/24", nil
 		},
 	}
 	mockMetalLB := &MockMetalLBClient{
@@ -87,8 +87,12 @@ func TestController_reconcile(t *testing.T) {
 	}
 
 	// Create a service, namespace, secret, and configmap
+	appNs := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "rancher-fip-manager"}}
+	_, err := clientset.CoreV1().Namespaces().Create(context.Background(), appNs, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
 	ns := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-ns", Labels: map[string]string{"field.cattle.io/projectId": "p-12345"}}}
-	_, err := clientset.CoreV1().Namespaces().Create(context.Background(), ns, metav1.CreateOptions{})
+	_, err = clientset.CoreV1().Namespaces().Create(context.Background(), ns, metav1.CreateOptions{})
 	assert.NoError(t, err)
 
 	secret := &v1.Secret{
@@ -165,22 +169,34 @@ func TestController_reconcile_delete(t *testing.T) {
 	}
 
 	// Create a service, namespace, and secret
+	appNs := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "rancher-fip-manager"}}
+	_, err := clientset.CoreV1().Namespaces().Create(context.Background(), appNs, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
 	ns := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-ns", Labels: map[string]string{"field.cattle.io/projectId": "p-12345"}}}
-	_, err := clientset.CoreV1().Namespaces().Create(context.Background(), ns, metav1.CreateOptions{})
+	_, err = clientset.CoreV1().Namespaces().Create(context.Background(), ns, metav1.CreateOptions{})
 	assert.NoError(t, err)
 
 	secret := &v1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "rancher-fip-config-p-12345", Namespace: "rancher-fip-manager"},
 		Data: map[string][]byte{
-			"apiUrl":         []byte("http://localhost"),
-			"clientId":       []byte("id"),
-			"clientSecret":   []byte("secret"),
-			"floatingIPPool": []byte("pool1"),
-			"cluster":        []byte("c-12345"),
-			"project":        []byte("p-12345"),
+			"apiUrl":           []byte("http://localhost"),
+			"clientId":         []byte("id"),
+			"clientSecret":     []byte("secret"),
+			"floatingIPPool":   []byte("pool1"),
+			"cluster":          []byte("c-12345"),
+			"project":          []byte("p-12345"),
+			"loadBalancerType": []byte("metallb"),
 		},
 	}
 	_, err = clientset.CoreV1().Secrets("rancher-fip-manager").Create(context.Background(), secret, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
+	cm := &v1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "network-interface-mappings", Namespace: "rancher-fip-manager"},
+		Data:       map[string]string{"pool1": "eth0"},
+	}
+	_, err = clientset.CoreV1().ConfigMaps("rancher-fip-manager").Create(context.Background(), cm, metav1.CreateOptions{})
 	assert.NoError(t, err)
 
 	now := metav1.Now()
@@ -234,8 +250,12 @@ func TestController_reconcile_no_secret(t *testing.T) {
 	}
 
 	// Create a namespace and service, but no secret
+	appNs := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "rancher-fip-manager"}}
+	_, err := clientset.CoreV1().Namespaces().Create(context.Background(), appNs, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
 	ns := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-ns", Labels: map[string]string{"field.cattle.io/projectId": "p-12345"}}}
-	_, err := clientset.CoreV1().Namespaces().Create(context.Background(), ns, metav1.CreateOptions{})
+	_, err = clientset.CoreV1().Namespaces().Create(context.Background(), ns, metav1.CreateOptions{})
 	assert.NoError(t, err)
 
 	svc := &v1.Service{
@@ -261,9 +281,9 @@ func TestController_reconcile_ipam_request_error(t *testing.T) {
 
 	requestCalled := false
 	mockIPAM := &MockIPAMClient{
-		RequestFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) (string, error) {
+		RequestFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) (string, string, error) {
 			requestCalled = true
-			return "", assert.AnError
+			return "", "", assert.AnError
 		},
 	}
 	mockMetalLB := &MockMetalLBClient{}
@@ -279,8 +299,12 @@ func TestController_reconcile_ipam_request_error(t *testing.T) {
 	}
 
 	// Create a service, namespace, secret, and configmap
+	appNs := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "rancher-fip-manager"}}
+	_, err := clientset.CoreV1().Namespaces().Create(context.Background(), appNs, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
 	ns := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-ns", Labels: map[string]string{"field.cattle.io/projectId": "p-12345"}}}
-	_, err := clientset.CoreV1().Namespaces().Create(context.Background(), ns, metav1.CreateOptions{})
+	_, err = clientset.CoreV1().Namespaces().Create(context.Background(), ns, metav1.CreateOptions{})
 	assert.NoError(t, err)
 
 	secret := &v1.Secret{
@@ -328,9 +352,9 @@ func TestController_reconcile_ipam_quota_exceeded(t *testing.T) {
 
 	requestCalled := false
 	mockIPAM := &MockIPAMClient{
-		RequestFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) (string, error) {
+		RequestFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) (string, string, error) {
 			requestCalled = true
-			return "", fmt.Errorf("quota exceeded")
+			return "", "", fmt.Errorf("quota exceeded")
 		},
 	}
 	mockMetalLB := &MockMetalLBClient{}
@@ -346,8 +370,12 @@ func TestController_reconcile_ipam_quota_exceeded(t *testing.T) {
 	}
 
 	// Create a service, namespace, secret, and configmap
+	appNs := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "rancher-fip-manager"}}
+	_, err := clientset.CoreV1().Namespaces().Create(context.Background(), appNs, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
 	ns := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-ns", Labels: map[string]string{"field.cattle.io/projectId": "p-12345"}}}
-	_, err := clientset.CoreV1().Namespaces().Create(context.Background(), ns, metav1.CreateOptions{})
+	_, err = clientset.CoreV1().Namespaces().Create(context.Background(), ns, metav1.CreateOptions{})
 	assert.NoError(t, err)
 
 	secret := &v1.Secret{
@@ -425,8 +453,12 @@ func TestController_reconcile_delete_ipam_release_error(t *testing.T) {
 	}
 
 	// Create a service, namespace, and secret
+	appNs := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "rancher-fip-manager"}}
+	_, err := clientset.CoreV1().Namespaces().Create(context.Background(), appNs, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
 	ns := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-ns", Labels: map[string]string{"field.cattle.io/projectId": "p-12345"}}}
-	_, err := clientset.CoreV1().Namespaces().Create(context.Background(), ns, metav1.CreateOptions{})
+	_, err = clientset.CoreV1().Namespaces().Create(context.Background(), ns, metav1.CreateOptions{})
 	assert.NoError(t, err)
 
 	secret := &v1.Secret{
@@ -441,6 +473,13 @@ func TestController_reconcile_delete_ipam_release_error(t *testing.T) {
 		},
 	}
 	_, err = clientset.CoreV1().Secrets("rancher-fip-manager").Create(context.Background(), secret, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
+	cm := &v1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "network-interface-mappings", Namespace: "rancher-fip-manager"},
+		Data:       map[string]string{"pool1": "eth0"},
+	}
+	_, err = clientset.CoreV1().ConfigMaps("rancher-fip-manager").Create(context.Background(), cm, metav1.CreateOptions{})
 	assert.NoError(t, err)
 
 	now := metav1.Now()
@@ -482,8 +521,8 @@ func TestController_reconcile_get_ip_address_pools(t *testing.T) {
 
 	// Mock IPAM client that returns a successful FIP request
 	mockIPAM := &MockIPAMClient{
-		RequestFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) (string, error) {
-			return "1.2.3.4", nil
+		RequestFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) (string, string, error) {
+			return "1.2.3.4", "1.2.3.4/24", nil
 		},
 	}
 
@@ -539,19 +578,24 @@ func TestController_reconcile_get_ip_address_pools(t *testing.T) {
 	}
 
 	// Create a service, namespace, secret, and configmap
+	appNs := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "rancher-fip-manager"}}
+	_, err := clientset.CoreV1().Namespaces().Create(context.Background(), appNs, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
 	ns := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-ns", Labels: map[string]string{"field.cattle.io/projectId": "p-12345"}}}
-	_, err := clientset.CoreV1().Namespaces().Create(context.Background(), ns, metav1.CreateOptions{})
+	_, err = clientset.CoreV1().Namespaces().Create(context.Background(), ns, metav1.CreateOptions{})
 	assert.NoError(t, err)
 
 	secret := &v1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "rancher-fip-config-p-12345", Namespace: "rancher-fip-manager"},
 		Data: map[string][]byte{
-			"apiUrl":         []byte("http://localhost"),
-			"clientId":       []byte("id"),
-			"clientSecret":   []byte("secret"),
-			"floatingIPPool": []byte("pool1"),
-			"cluster":        []byte("c-12345"),
-			"project":        []byte("p-12345"),
+			"apiUrl":          []byte("http://localhost"),
+			"clientId":        []byte("id"),
+			"clientSecret":    []byte("secret"),
+			"floatingIPPool":  []byte("pool1"),
+			"cluster":         []byte("c-12345"),
+			"project":         []byte("p-12345"),
+			"loadBalancerType": []byte("metallb"),
 		},
 	}
 	_, err = clientset.CoreV1().Secrets("rancher-fip-manager").Create(context.Background(), secret, metav1.CreateOptions{})

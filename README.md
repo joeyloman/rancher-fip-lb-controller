@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `rancher-fip-lb-controller` is a Kubernetes controller that manages MetalLB `IPAddressPool` and `L2Advertisement` resources based on `LoadBalancer` services in a Rancher-managed cluster. It integrates with an external IPAM solution to request and release floating IP addresses.
+The `rancher-fip-lb-controller` is a Kubernetes controller that manages MetalLB `IPAddressPool` and `L2Advertisement` and PureLB `ServiceGroup` and `LBNodeAgent` resources based on `LoadBalancer` services in a Rancher-managed cluster. It integrates with an external IPAM solution to request and release floating IP addresses.
 
 ## Building the Controller
 
@@ -61,6 +61,7 @@ stringData:
   cluster: "your-cluster-name"
   project: "your-project-name"
   floatingIPPool: "your-fip-pool"
+  loadBalancerType: "<metallb or purelb>"
 ```
 
 ## Service Annotations and Labels
@@ -91,7 +92,7 @@ The controller also adds a finalizer `rancher.k8s.binbash.org/floatingip-cleanup
 
 ## Network Interface Mappings
 
-You must create a `ConfigMap` in the `rancher-fip-manager` namespace that maps floating IP pools to network interfaces for MetalLB's `L2Advertisement`.
+You must create a `ConfigMap` in the `rancher-fip-manager` namespace that maps floating IP pools to network interfaces for MetalLB's `L2Advertisement` or PureLB's `LBNodeAgent`.
 
 ```yaml
 apiVersion: v1
