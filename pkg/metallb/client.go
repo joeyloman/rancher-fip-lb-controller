@@ -49,12 +49,29 @@ func (c *Client) CreateL2Advertisement(ctx context.Context, ad *metallbv1beta1.L
 	return c.client.Create(ctx, ad)
 }
 
+// GetIPAddressPool gets an IPAddressPool by name.
+func (c *Client) GetIPAddressPool(ctx context.Context, name, namespace string) (*metallbv1beta1.IPAddressPool, error) {
+	pool := &metallbv1beta1.IPAddressPool{}
+	pool.Name = name
+	pool.Namespace = namespace
+	err := c.client.Get(ctx, client.ObjectKeyFromObject(pool), pool)
+	if err != nil {
+		return nil, err
+	}
+	return pool, nil
+}
+
 // DeleteIPAddressPool deletes an IPAddressPool.
 func (c *Client) DeleteIPAddressPool(ctx context.Context, name, namespace string) error {
 	pool := &metallbv1beta1.IPAddressPool{}
 	pool.Name = name
 	pool.Namespace = namespace
 	return c.client.Delete(ctx, pool)
+}
+
+// UpdateIPAddressPool updates an IPAddressPool.
+func (c *Client) UpdateIPAddressPool(ctx context.Context, pool *metallbv1beta1.IPAddressPool) error {
+	return c.client.Update(ctx, pool)
 }
 
 // DeleteL2Advertisement deletes an L2Advertisement.

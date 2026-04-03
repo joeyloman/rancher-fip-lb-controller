@@ -81,10 +81,10 @@ func TestController_Integration_MetalLB(t *testing.T) {
 
 	// In the integration test, we still want to mock the IPAM client
 	mockIPAM := &MockIPAMClient{
-		RequestFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) (string, string, error) {
-			return "1.2.3.4", "1.2.3.4/24", nil
+		RequestFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) (string, string, string, error) {
+			return "1.2.3.4", "1.2.3.4/24", "shared-key", nil
 		},
-		ReleaseFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) error {
+		ReleaseFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) error {
 			return nil
 		},
 	}
@@ -236,10 +236,10 @@ func TestController_Integration_PureLB(t *testing.T) {
 
 	// In the integration test, we still want to mock the IPAM client
 	mockIPAM := &MockIPAMClient{
-		RequestFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) (string, string, error) {
-			return "1.2.3.4", "1.2.3.4/24", nil
+		RequestFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) (string, string, string, error) {
+			return "1.2.3.4", "1.2.3.4/24", "shared-key", nil
 		},
-		ReleaseFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) error {
+		ReleaseFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) error {
 			return nil
 		},
 	}

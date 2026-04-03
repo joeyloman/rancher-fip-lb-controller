@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -117,8 +118,8 @@ func (c *Controller) processNextItem() bool {
 }
 
 type ipamClient interface {
-	RequestFIP(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) (string, string, error)
-	ReleaseFIP(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) error
+	RequestFIP(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) (string, string, string, error)
+	ReleaseFIP(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) error
 }
 
 type metallbClient interface {
@@ -127,6 +128,8 @@ type metallbClient interface {
 	DeleteIPAddressPool(ctx context.Context, name, namespace string) error
 	DeleteL2Advertisement(ctx context.Context, name, namespace string) error
 	GetIPAddressPools(ctx context.Context, namespace string) ([]v1beta1.IPAddressPool, error)
+	GetIPAddressPool(ctx context.Context, name, namespace string) (*v1beta1.IPAddressPool, error)
+	UpdateIPAddressPool(ctx context.Context, pool *v1beta1.IPAddressPool) error
 }
 
 type purelbClient interface {
@@ -189,6 +192,8 @@ func (r *reconciler) getProjectIDFromAppNamespace() (string, error) {
 
 func (r *reconciler) reconcile(svc *v1.Service) error {
 	var ipAddress string
+	var poolName string
+	var floatingIPGroup string
 	var projectId string
 	var ok bool
 
@@ -198,6 +203,10 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 	})
 
 	logger.Info("Reconciling Service")
+
+	if svc.Annotations["rancher.k8s.binbash.org/floatingip-group"] != "" {
+		floatingIPGroup = svc.Annotations["rancher.k8s.binbash.org/floatingip-group"]
+	}
 
 	// Handle service deletion
 	if svc.ObjectMeta.DeletionTimestamp != nil {
@@ -268,6 +277,7 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 					svc.Namespace,
 					svc.Name,
 					ipAddress,
+					floatingIPGroup,
 				)
 				if err != nil {
 					return fmt.Errorf("failed to release FIP: %w", err)
@@ -309,25 +319,61 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 				logger.Infof("Successfully released FIP %s", ipAddress)
 			}
 
-			poolName := fmt.Sprintf("rancher-fip-%s-%s", svc.Namespace, svc.Name)
+			if ipAddress != "" {
+				// Check if the floatingIPGroup string is not empty
+				skipDeletion := false
+				if floatingIPGroup != "" {
+					// Check if there are more services with the same floatingIPGroup and ip address
+					serviceList, err := r.clientset.CoreV1().Services("").List(context.Background(), metav1.ListOptions{})
+					if err != nil {
+						return fmt.Errorf("failed to list services: %w", err)
+					}
+					for _, otherSvc := range serviceList.Items {
+						if otherSvc.Name == svc.Name && otherSvc.Namespace == svc.Namespace {
+							continue
+						}
+						otherFloatingIPGroup := otherSvc.Annotations["rancher.k8s.binbash.org/floatingip-group"]
+						otherFloatingIP := otherSvc.Annotations["rancher.k8s.binbash.org/floatingip"]
+						if otherFloatingIPGroup == floatingIPGroup && otherFloatingIP == ipAddress {
+							skipDeletion = true
+							break
+						}
+					}
+				}
 
-			if string(secret.Data["loadBalancerType"]) == "metallb" {
-				// Delete MetalLB resources
-				if err := r.metallbClient.DeleteIPAddressPool(context.Background(), poolName, r.appNamespace); err != nil && !errors.IsNotFound(err) {
-					return fmt.Errorf("failed to delete IPAddressPool %s: %w", poolName, err)
+				if !skipDeletion {
+					// Check if the allocatedIPAddress is an IPv4 or IPv6 address so we can set the poolName
+					ip := net.ParseIP(ipAddress)
+					if ip == nil {
+						return fmt.Errorf("failed to parse allocated IP address: %s", ipAddress)
+					}
+					if ip.To4() != nil {
+						poolName = fmt.Sprintf("ip4-%s", ipAddress)
+					} else {
+						// For IPv6, replace ":" with "." in the address
+						ipv6Formatted := strings.ReplaceAll(ipAddress, ":", ".")
+						poolName = fmt.Sprintf("ip6-%s", ipv6Formatted)
+					}
+
+					if string(secret.Data["loadBalancerType"]) == "metallb" {
+						// Delete MetalLB resources
+						if err := r.metallbClient.DeleteIPAddressPool(context.Background(), poolName, r.appNamespace); err != nil && !errors.IsNotFound(err) {
+							return fmt.Errorf("failed to delete IPAddressPool %s: %w", poolName, err)
+						}
+						if err := r.metallbClient.DeleteL2Advertisement(context.Background(), poolName, r.appNamespace); err != nil && !errors.IsNotFound(err) {
+							return fmt.Errorf("failed to delete L2Advertisement %s: %w", poolName, err)
+						}
+					} else if string(secret.Data["loadBalancerType"]) == "purelb" {
+						// Delete PureLB resources
+						if err := r.purelbClient.DeleteServiceGroup(context.Background(), poolName, r.appNamespace); err != nil && !errors.IsNotFound(err) {
+							return fmt.Errorf("failed to delete ServiceGroup %s: %w", poolName, err)
+						}
+						// Not needed for now, but keeping the code here for future reference
+						// if err := r.purelbClient.DeleteLBNodeAgent(context.Background(), poolName, r.appNamespace); err != nil && !errors.IsNotFound(err) {
+						// 	return fmt.Errorf("failed to delete LBNodeAgent %s: %w", poolName, err)
+						// }
+					}
 				}
-				if err := r.metallbClient.DeleteL2Advertisement(context.Background(), poolName, r.appNamespace); err != nil && !errors.IsNotFound(err) {
-					return fmt.Errorf("failed to delete L2Advertisement %s: %w", poolName, err)
-				}
-			} else if string(secret.Data["loadBalancerType"]) == "purelb" {
-				// Delete PureLB resources
-				if err := r.purelbClient.DeleteServiceGroup(context.Background(), poolName, r.appNamespace); err != nil && !errors.IsNotFound(err) {
-					return fmt.Errorf("failed to delete ServiceGroup %s: %w", poolName, err)
-				}
-				// Not needed for now, but keeping the code here for future reference
-				// if err := r.purelbClient.DeleteLBNodeAgent(context.Background(), poolName, r.appNamespace); err != nil && !errors.IsNotFound(err) {
-				// 	return fmt.Errorf("failed to delete LBNodeAgent %s: %w", poolName, err)
-				// }
 			}
 
 			// Remove the finalizer
@@ -451,7 +497,7 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 	}
 
 	// Request a floating IP
-	allocatedIPAddress, subnet, err := r.ipamClient.RequestFIP(
+	allocatedIPAddress, subnet, sharedKey, err := r.ipamClient.RequestFIP(
 		string(secret.Data["clientSecret"]),
 		string(secret.Data["cluster"]),
 		string(secret.Data["project"]),
@@ -459,6 +505,7 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 		svc.Namespace,
 		svc.Name,
 		ipAddress,
+		floatingIPGroup,
 	)
 	if err != nil {
 		if strings.Contains(err.Error(), "quota exceeded") {
@@ -475,83 +522,164 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 	}
 	logger.Infof("Successfully requested FIP %s", allocatedIPAddress)
 
-	poolName := fmt.Sprintf("rancher-fip-%s-%s", svc.Namespace, svc.Name)
+	// Check if the allocatedIPAddress is an IPv4 or IPv6 address so we can set the poolName
+	ip := net.ParseIP(allocatedIPAddress)
+	if ip == nil {
+		return fmt.Errorf("failed to parse allocated IP address: %s", allocatedIPAddress)
+	}
+	if ip.To4() != nil {
+		poolName = fmt.Sprintf("ip4-%s", allocatedIPAddress)
+	} else {
+		// For IPv6, replace ":" with "." in the address
+		ipv6Formatted := strings.ReplaceAll(allocatedIPAddress, ":", ".")
+		poolName = fmt.Sprintf("ip6-%s", ipv6Formatted)
+	}
 
 	if string(secret.Data["loadBalancerType"]) == "metallb" {
-		// Create MetalLB resources
-		ipAddressPool := &v1beta1.IPAddressPool{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      poolName,
-				Namespace: r.appNamespace,
-			},
-			Spec: v1beta1.IPAddressPoolSpec{
-				Addresses: []string{
-					fmt.Sprintf("%s/32", allocatedIPAddress),
+		// Check if floatingIPGroup is not empty and if the IPAddressPool already exists
+		poolAlreadyExists := false
+		if floatingIPGroup != "" {
+			existingPool, err := r.metallbClient.GetIPAddressPool(context.Background(), poolName, r.appNamespace)
+			if err == nil && existingPool != nil {
+				// Pool exists, update it by adding the namespace if not already present
+				logger.Infof("IPAddressPool %s already exists, updating with namespace %s", poolName, svc.Namespace)
+				namespaceExists := false
+				for _, ns := range existingPool.Spec.AllocateTo.Namespaces {
+					if ns == svc.Namespace {
+						namespaceExists = true
+						break
+					}
+				}
+				if !namespaceExists {
+					existingPool.Spec.AllocateTo.Namespaces = append(existingPool.Spec.AllocateTo.Namespaces, svc.Namespace)
+					if err := r.metallbClient.UpdateIPAddressPool(context.Background(), existingPool); err != nil {
+						return fmt.Errorf("failed to update IPAddressPool: %w", err)
+					}
+					logger.Infof("Successfully updated IPAddressPool %s with namespace %s", poolName, svc.Namespace)
+				}
+				// Skip the rest of the MetalLB resource creation since we're just updating the pool
+				poolAlreadyExists = true
+			} else if err != nil && !errors.IsNotFound(err) {
+				// If error is not "not found", log it but continue to create the pool
+				logger.Warnf("Failed to get IPAddressPool %s: %v, proceeding to create it", poolName, err)
+			}
+		}
+
+		// Create MetalLB resources only if pool doesn't already exist
+		var ipAddressPool *v1beta1.IPAddressPool
+		if !poolAlreadyExists {
+			// Determine the match labels
+			matchLabels := make(map[string]string)
+			if floatingIPGroup != "" {
+				matchLabels["rancher.k8s.binbash.org/servicegroup"] = floatingIPGroup
+			} else {
+				matchLabels["rancher.k8s.binbash.org/service"] = svc.Name
+				matchLabels["rancher.k8s.binbash.org/servicenamespace"] = svc.Namespace
+			}
+			ipAddressPool = &v1beta1.IPAddressPool{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      poolName,
+					Namespace: r.appNamespace,
 				},
-				AllocateTo: &v1beta1.ServiceAllocation{
-					Namespaces: []string{svc.Namespace},
-					ServiceSelectors: []metav1.LabelSelector{
-						{
-							MatchLabels: map[string]string{
-								"rancher.k8s.binbash.org/service":          svc.Name,
-								"rancher.k8s.binbash.org/servicenamespace": svc.Namespace,
+				Spec: v1beta1.IPAddressPoolSpec{
+					Addresses: []string{
+						fmt.Sprintf("%s/32", allocatedIPAddress),
+					},
+					AllocateTo: &v1beta1.ServiceAllocation{
+						Namespaces: []string{svc.Namespace},
+						ServiceSelectors: []metav1.LabelSelector{
+							{
+								MatchLabels: matchLabels,
 							},
 						},
 					},
 				},
-			},
-		}
+			}
 
-		if err := r.metallbClient.CreateIPAddressPool(context.Background(), ipAddressPool); err != nil && !errors.IsAlreadyExists(err) {
-			// if an IP is already a part of an existing IPAddressPool, it was not properly released, so we need to clean things up and try again
-			if strings.Contains(err.Error(), "overlaps with already defined CIDR") {
-				logger.Warnf("IP %s is already a part of an existing MetalLBIPAddressPool, trying to clean things up and try again", allocatedIPAddress)
-				// get all IPAddressPools, loop through them and identify the CIDR that overlaps
-				ipAddressPools, err := r.metallbClient.GetIPAddressPools(context.Background(), r.appNamespace)
-				if err != nil {
-					return fmt.Errorf("failed to get IPAddressPools: %w", err)
-				}
-				for _, p := range ipAddressPools {
-					for _, a := range p.Spec.Addresses {
-						if a == fmt.Sprintf("%s/32", allocatedIPAddress) {
-							logger.Infof("CIDR %s/32 found in MetalLB IPAddressPool %s/%s, removing the old L2Advertisement and IPAddressPool", allocatedIPAddress, p.Namespace, p.Name)
-							var releaseFIP bool = false
-							if err := r.metallbClient.DeleteL2Advertisement(context.Background(), p.Name, r.appNamespace); err != nil {
-								logger.Errorf("failed to delete L2Advertisement: %s", err)
-								releaseFIP = true
-							}
-							if err := r.metallbClient.DeleteIPAddressPool(context.Background(), p.Name, r.appNamespace); err != nil {
-								logger.Errorf("failed to delete IPAddressPool: %s", err)
-								releaseFIP = true
-							}
-							if releaseFIP {
-								errRelease := r.ipamClient.ReleaseFIP(
-									string(secret.Data["clientSecret"]),
-									string(secret.Data["cluster"]),
-									string(secret.Data["project"]),
-									fipPoolName,
-									svc.Namespace,
-									svc.Name,
-									allocatedIPAddress,
-								)
-								if errRelease != nil {
-									return fmt.Errorf("failed to release FIP during CreateIPAddressPool cleanup: %v, original error: %w", errRelease, err)
+			if err := r.metallbClient.CreateIPAddressPool(context.Background(), ipAddressPool); err != nil && !errors.IsAlreadyExists(err) {
+				// if an IP is already a part of an existing IPAddressPool, it was not properly released, so we need to clean things up and try again
+				if strings.Contains(err.Error(), "overlaps with already defined CIDR") {
+					logger.Warnf("IP %s is already a part of an existing MetalLBIPAddressPool, trying to clean things up and try again", allocatedIPAddress)
+					// get all IPAddressPools, loop through them and identify the CIDR that overlaps
+					ipAddressPools, err := r.metallbClient.GetIPAddressPools(context.Background(), r.appNamespace)
+					if err != nil {
+						return fmt.Errorf("failed to get IPAddressPools: %w", err)
+					}
+					for _, p := range ipAddressPools {
+						for _, a := range p.Spec.Addresses {
+							if a == fmt.Sprintf("%s/32", allocatedIPAddress) {
+								logger.Infof("CIDR %s/32 found in MetalLB IPAddressPool %s/%s, removing the old L2Advertisement and IPAddressPool", allocatedIPAddress, p.Namespace, p.Name)
+								var releaseFIP bool = false
+								if err := r.metallbClient.DeleteL2Advertisement(context.Background(), p.Name, r.appNamespace); err != nil {
+									logger.Errorf("failed to delete L2Advertisement: %s", err)
+									releaseFIP = true
 								}
-								return fmt.Errorf("failed to create IPAddressPool: %w", err)
-							}
-							logger.Infof("Successfully deleted the old MetalLB L2Advertisement and IPAddressPool %s/%s, trying to create a new one", r.appNamespace, ipAddressPool.Name)
+								if err := r.metallbClient.DeleteIPAddressPool(context.Background(), p.Name, r.appNamespace); err != nil {
+									logger.Errorf("failed to delete IPAddressPool: %s", err)
+									releaseFIP = true
+								}
+								if releaseFIP {
+									errRelease := r.ipamClient.ReleaseFIP(
+										string(secret.Data["clientSecret"]),
+										string(secret.Data["cluster"]),
+										string(secret.Data["project"]),
+										fipPoolName,
+										svc.Namespace,
+										svc.Name,
+										allocatedIPAddress,
+										floatingIPGroup,
+									)
+									if errRelease != nil {
+										return fmt.Errorf("failed to release FIP during CreateIPAddressPool cleanup: %v, original error: %w", errRelease, err)
+									}
+									return fmt.Errorf("failed to create IPAddressPool: %w", err)
+								}
+								logger.Infof("Successfully deleted the old MetalLB L2Advertisement and IPAddressPool %s/%s, trying to create a new one", r.appNamespace, ipAddressPool.Name)
 
-							// Retry the creation of the IPAddressPool
-							if err := r.metallbClient.CreateIPAddressPool(context.Background(), ipAddressPool); err != nil && !errors.IsAlreadyExists(err) {
-								return fmt.Errorf("failed to create IPAddressPool: %w", err)
+								// Retry the creation of the IPAddressPool
+								if err := r.metallbClient.CreateIPAddressPool(context.Background(), ipAddressPool); err != nil && !errors.IsAlreadyExists(err) {
+									return fmt.Errorf("failed to create IPAddressPool: %w", err)
+								}
+								logger.Infof("Successfully created IPAddressPool %s/%s", r.appNamespace, poolName)
+								break
 							}
-							logger.Infof("Successfully created IPAddressPool %s/%s", r.appNamespace, poolName)
-							break
 						}
 					}
+				} else {
+					logger.Errorf("Failed to create MetalLB IPAddressPool: %s, releasing the FloatingIP", err)
+					errRelease := r.ipamClient.ReleaseFIP(
+						string(secret.Data["clientSecret"]),
+						string(secret.Data["cluster"]),
+						string(secret.Data["project"]),
+						fipPoolName,
+						svc.Namespace,
+						svc.Name,
+						allocatedIPAddress,
+						floatingIPGroup,
+					)
+					if errRelease != nil {
+						return fmt.Errorf("failed to release FIP during CreateIPAddressPool cleanup: %v, original error: %w", errRelease, err)
+					}
+					return fmt.Errorf("failed to create IPAddressPool: %w", err)
 				}
-			} else {
-				logger.Errorf("Failed to create MetalLB IPAddressPool: %s, releasing the FloatingIP", err)
+			}
+
+			l2Advertisement := &v1beta1.L2Advertisement{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      poolName,
+					Namespace: r.appNamespace,
+				},
+				Spec: v1beta1.L2AdvertisementSpec{
+					IPAddressPools: []string{poolName},
+					Interfaces:     []string{networkInterface},
+				},
+			}
+			if err := r.metallbClient.CreateL2Advertisement(context.Background(), l2Advertisement); err != nil && !errors.IsAlreadyExists(err) {
+				logger.Errorf("Failed to create MetalLB L2Advertisement: %s, cleaning up and releasing the FloatingIP", err)
+				errDelete := r.metallbClient.DeleteIPAddressPool(context.Background(), poolName, r.appNamespace)
+				if errDelete != nil {
+					return fmt.Errorf("failed to delete IPAddressPool during CreateL2Advertisement cleanup: %v, original error: %w", errDelete, err)
+				}
 				errRelease := r.ipamClient.ReleaseFIP(
 					string(secret.Data["clientSecret"]),
 					string(secret.Data["cluster"]),
@@ -560,43 +688,13 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 					svc.Namespace,
 					svc.Name,
 					allocatedIPAddress,
+					floatingIPGroup,
 				)
 				if errRelease != nil {
-					return fmt.Errorf("failed to release FIP during CreateIPAddressPool cleanup: %v, original error: %w", errRelease, err)
+					return fmt.Errorf("failed to release FIP during CreateL2Advertisement cleanup: %v, original error: %w", errRelease, err)
 				}
-				return fmt.Errorf("failed to create IPAddressPool: %w", err)
+				return fmt.Errorf("failed to create L2Advertisement: %w", err)
 			}
-		}
-
-		l2Advertisement := &v1beta1.L2Advertisement{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      poolName,
-				Namespace: r.appNamespace,
-			},
-			Spec: v1beta1.L2AdvertisementSpec{
-				IPAddressPools: []string{poolName},
-				Interfaces:     []string{networkInterface},
-			},
-		}
-		if err := r.metallbClient.CreateL2Advertisement(context.Background(), l2Advertisement); err != nil && !errors.IsAlreadyExists(err) {
-			logger.Errorf("Failed to create MetalLB L2Advertisement: %s, cleaning up and releasing the FloatingIP", err)
-			errDelete := r.metallbClient.DeleteIPAddressPool(context.Background(), poolName, r.appNamespace)
-			if errDelete != nil {
-				return fmt.Errorf("failed to delete IPAddressPool during CreateL2Advertisement cleanup: %v, original error: %w", errDelete, err)
-			}
-			errRelease := r.ipamClient.ReleaseFIP(
-				string(secret.Data["clientSecret"]),
-				string(secret.Data["cluster"]),
-				string(secret.Data["project"]),
-				fipPoolName,
-				svc.Namespace,
-				svc.Name,
-				allocatedIPAddress,
-			)
-			if errRelease != nil {
-				return fmt.Errorf("failed to release FIP during CreateL2Advertisement cleanup: %v, original error: %w", errRelease, err)
-			}
-			return fmt.Errorf("failed to create L2Advertisement: %w", err)
 		}
 	} else if string(secret.Data["loadBalancerType"]) == "purelb" {
 		// Create PureLB resources
@@ -618,24 +716,44 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 			},
 		}
 
-		if err := r.purelbClient.CreateServiceGroup(context.Background(), serviceGroup); err != nil {
-			logger.Errorf("Failed to create PureLB ServiceGroup: %s, releasing the FloatingIP", err)
-			errRelease := r.ipamClient.ReleaseFIP(
-				string(secret.Data["clientSecret"]),
-				string(secret.Data["cluster"]),
-				string(secret.Data["project"]),
-				fipPoolName,
-				svc.Namespace,
-				svc.Name,
-				allocatedIPAddress,
-			)
-			if errRelease != nil {
-				return fmt.Errorf("failed to release FIP during CreateServiceGroup cleanup: %v, original error: %w", errRelease, err)
+		// Check if the floatingIPGroup is set and if the PureLB service group already exists
+		// If so, skip creating a new ServiceGroup
+		skipServiceGroupCreation := false
+		if floatingIPGroup != "" {
+			serviceGroups, err := r.purelbClient.GetServiceGroups(context.Background(), r.appNamespace)
+			if err != nil {
+				return fmt.Errorf("failed to get ServiceGroups: %w", err)
 			}
-			return fmt.Errorf("failed to create ServiceGroup: %w", err)
+			for _, sg := range serviceGroups {
+				if sg.Name == poolName {
+					logger.Infof("Found existing PureLB ServiceGroup %s/%s for floatingIPGroup %s, skipping creation", r.appNamespace, poolName, floatingIPGroup)
+					skipServiceGroupCreation = true
+					break
+				}
+			}
+		}
 
-		} else {
-			logger.Infof("Successfully created PureLB ServiceGroup %s/%s", r.appNamespace, poolName)
+		if !skipServiceGroupCreation {
+			if err := r.purelbClient.CreateServiceGroup(context.Background(), serviceGroup); err != nil {
+				logger.Errorf("Failed to create PureLB ServiceGroup: %s, releasing the FloatingIP", err)
+				errRelease := r.ipamClient.ReleaseFIP(
+					string(secret.Data["clientSecret"]),
+					string(secret.Data["cluster"]),
+					string(secret.Data["project"]),
+					fipPoolName,
+					svc.Namespace,
+					svc.Name,
+					allocatedIPAddress,
+					floatingIPGroup,
+				)
+				if errRelease != nil {
+					return fmt.Errorf("failed to release FIP during CreateServiceGroup cleanup: %v, original error: %w", errRelease, err)
+				}
+				return fmt.Errorf("failed to create ServiceGroup: %w", err)
+
+			} else {
+				logger.Infof("Successfully created PureLB ServiceGroup %s/%s", r.appNamespace, poolName)
+			}
 
 			// Not needed for now, but keeping the code here for future reference
 			// sendGARP := true
@@ -681,23 +799,92 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 		if currentSvc.Labels != nil {
 			serviceNamespaceLabelValue, serviceNamespaceLabelPresent = currentSvc.Labels["rancher.k8s.binbash.org/servicenamespace"]
 		}
+		serviceGroupLabelValue, serviceGroupLabelPresent := "", false
+		if currentSvc.Labels != nil {
+			serviceGroupLabelValue, serviceGroupLabelPresent = currentSvc.Labels["rancher.k8s.binbash.org/servicegroup"]
+		}
 		fipAnnotationValue, fipAnnotationPresent := "", false
 		if currentSvc.Annotations != nil {
 			fipAnnotationValue, fipAnnotationPresent = currentSvc.Annotations["rancher.k8s.binbash.org/floatingip"]
 		}
+		fipGroupAnnotationValue, fipGroupAnnotationPresent := "", false
+		if currentSvc.Annotations != nil {
+			fipGroupAnnotationValue, fipGroupAnnotationPresent = currentSvc.Annotations["rancher.k8s.binbash.org/floatingip-group"]
+		}
+
+		var metallbAllowSharedIPValue string = ""
+		var metallbAllowSharedIPPresent bool = false
 
 		var serviceGroupAnnotationValue string = ""
 		var serviceGroupAnnotationPresent bool = false
-		if string(secret.Data["loadBalancerType"]) == "purelb" {
+		var purelbAllowSharedIPValue string = ""
+		var purelbAllowSharedIPPresent bool = false
+
+		if string(secret.Data["loadBalancerType"]) == "metallb" {
 			if currentSvc.Annotations != nil {
-				serviceGroupAnnotationValue, serviceGroupAnnotationPresent = currentSvc.Annotations["purelb.io/service-group"]
+				metallbAllowSharedIPValue, metallbAllowSharedIPPresent = currentSvc.Annotations["metallb.io/allow-shared-ip"]
 			}
 
-			if finalizerPresent && serviceLabelPresent && serviceLabelValue == currentSvc.Name && serviceNamespaceLabelPresent &&
-				serviceNamespaceLabelValue == svc.Namespace && fipAnnotationPresent && fipAnnotationValue == allocatedIPAddress &&
-				serviceGroupAnnotationPresent && serviceGroupAnnotationValue == poolName {
-				*svc = *currentSvc
-				return true, nil
+			// Check if fipGroupAnnotationPresent and sharedKey is not empty
+			if fipGroupAnnotationPresent && fipGroupAnnotationValue != "" && sharedKey != "" {
+				// Check if currentSvc.Annotations["metallb.io/allow-shared-ip"] == "sharedKey"
+				if metallbAllowSharedIPPresent && metallbAllowSharedIPValue == sharedKey {
+					if floatingIPGroup != "" {
+						if finalizerPresent && serviceGroupLabelPresent && serviceGroupLabelValue == floatingIPGroup &&
+							serviceLabelPresent && serviceLabelValue == currentSvc.Name && serviceNamespaceLabelPresent &&
+							serviceNamespaceLabelValue == svc.Namespace && fipAnnotationPresent && fipAnnotationValue == allocatedIPAddress {
+							*svc = *currentSvc
+							return true, nil
+						}
+					} else {
+						if finalizerPresent && serviceLabelPresent && serviceLabelValue == currentSvc.Name && serviceNamespaceLabelPresent &&
+							serviceNamespaceLabelValue == svc.Namespace && fipAnnotationPresent && fipAnnotationValue == allocatedIPAddress {
+							*svc = *currentSvc
+							return true, nil
+						}
+					}
+				}
+			} else {
+				if finalizerPresent && serviceLabelPresent && serviceLabelValue == currentSvc.Name && serviceNamespaceLabelPresent &&
+					serviceNamespaceLabelValue == svc.Namespace && fipAnnotationPresent && fipAnnotationValue == allocatedIPAddress {
+					*svc = *currentSvc
+					return true, nil
+				}
+			}
+		} else if string(secret.Data["loadBalancerType"]) == "purelb" {
+			if currentSvc.Annotations != nil {
+				serviceGroupAnnotationValue, serviceGroupAnnotationPresent = currentSvc.Annotations["purelb.io/service-group"]
+				purelbAllowSharedIPValue, purelbAllowSharedIPPresent = currentSvc.Annotations["purelb.io/allow-shared-ip"]
+			}
+
+			// Check if fipGroupAnnotationPresent and sharedKey is not empty
+			if fipGroupAnnotationPresent && fipGroupAnnotationValue != "" && sharedKey != "" {
+				// Check if currentSvc.Annotations["purelb.io/allow-shared-ip"] == "sharedKey"
+				if purelbAllowSharedIPPresent && purelbAllowSharedIPValue == sharedKey {
+					if floatingIPGroup != "" {
+						if finalizerPresent && serviceGroupLabelPresent && serviceGroupLabelValue == floatingIPGroup &&
+							serviceLabelPresent && serviceLabelValue == currentSvc.Name && serviceNamespaceLabelPresent &&
+							serviceNamespaceLabelValue == svc.Namespace && fipAnnotationPresent && fipAnnotationValue == allocatedIPAddress &&
+							serviceGroupAnnotationPresent && serviceGroupAnnotationValue == poolName {
+							*svc = *currentSvc
+							return true, nil
+						}
+					} else {
+						if finalizerPresent && serviceLabelPresent && serviceLabelValue == currentSvc.Name && serviceNamespaceLabelPresent &&
+							serviceNamespaceLabelValue == svc.Namespace && fipAnnotationPresent && fipAnnotationValue == allocatedIPAddress &&
+							serviceGroupAnnotationPresent && serviceGroupAnnotationValue == poolName {
+							*svc = *currentSvc
+							return true, nil
+						}
+					}
+				}
+			} else {
+				if finalizerPresent && serviceLabelPresent && serviceLabelValue == currentSvc.Name && serviceNamespaceLabelPresent &&
+					serviceNamespaceLabelValue == svc.Namespace && fipAnnotationPresent && fipAnnotationValue == allocatedIPAddress &&
+					serviceGroupAnnotationPresent && serviceGroupAnnotationValue == poolName {
+					*svc = *currentSvc
+					return true, nil
+				}
 			}
 		} else {
 			if finalizerPresent && serviceLabelPresent && serviceLabelValue == currentSvc.Name && serviceNamespaceLabelPresent &&
@@ -721,6 +908,10 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 			svcToUpdate.Labels["rancher.k8s.binbash.org/servicenamespace"] = svcToUpdate.Namespace
 			needsUpdate = true
 		}
+		if floatingIPGroup != "" && (!serviceGroupLabelPresent || serviceGroupLabelValue != floatingIPGroup) {
+			svcToUpdate.Labels["rancher.k8s.binbash.org/servicegroup"] = floatingIPGroup
+			needsUpdate = true
+		}
 
 		if svcToUpdate.Annotations == nil {
 			svcToUpdate.Annotations = make(map[string]string)
@@ -730,10 +921,25 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 			needsUpdate = true
 		}
 
-		if string(secret.Data["loadBalancerType"]) == "purelb" {
+		if string(secret.Data["loadBalancerType"]) == "metallb" {
+			// Add sharedKey annotation if fipGroupAnnotationPresent and sharedKey is not empty
+			if fipGroupAnnotationPresent && fipGroupAnnotationValue != "" && sharedKey != "" {
+				if !metallbAllowSharedIPPresent || metallbAllowSharedIPValue != sharedKey {
+					svcToUpdate.Annotations["metallb.io/allow-shared-ip"] = sharedKey
+					needsUpdate = true
+				}
+			}
+		} else if string(secret.Data["loadBalancerType"]) == "purelb" {
 			if !serviceGroupAnnotationPresent || serviceGroupAnnotationValue != poolName {
 				svcToUpdate.Annotations["purelb.io/service-group"] = poolName
 				needsUpdate = true
+			}
+			// Add sharedKey annotation if fipGroupAnnotationPresent and sharedKey is not empty
+			if fipGroupAnnotationPresent && fipGroupAnnotationValue != "" && sharedKey != "" {
+				if !purelbAllowSharedIPPresent || purelbAllowSharedIPValue != sharedKey {
+					svcToUpdate.Annotations["purelb.io/allow-shared-ip"] = sharedKey
+					needsUpdate = true
+				}
 			}
 		}
 
@@ -790,6 +996,7 @@ func (r *reconciler) reconcile(svc *v1.Service) error {
 			svc.Namespace,
 			svc.Name,
 			allocatedIPAddress,
+			floatingIPGroup,
 		)
 		if errRelease != nil {
 			return fmt.Errorf("failed to release FIP during finalizer update cleanup: %v, original error: %w", errRelease, err)

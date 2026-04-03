@@ -192,6 +192,7 @@ func (s *Server) handleFIPList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for i := range fipList.FloatingIPs {
+		// logrus.Infof("REMOVE: FloatingIP from list [%+v]", fipList.FloatingIPs[i])
 		if fipList.FloatingIPs[i].Cluster == "" {
 			fipList.FloatingIPs[i].Cluster = "Unassigned"
 		}
@@ -233,6 +234,7 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 	servicenamespace := r.FormValue("servicenamespace")
 	servicename := r.FormValue("servicename")
 	ipaddr := r.FormValue("ipaddr")
+	floatingipgroup := r.FormValue("floatingipgroup")
 
 	// Validate the form values
 	formValues := map[string]string{
@@ -275,6 +277,7 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf("failed to delete service %s/%s: %s", servicenamespace, servicename, err), http.StatusInternalServerError)
 			return
 		}
+		time.Sleep(1 * time.Second)
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	} else if !errors.IsNotFound(err) {
@@ -285,12 +288,13 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 		logrus.Infof("Service %s/%s does not exist, releasing FIP", servicenamespace, servicename)
 	}
 
-	if err := s.ipamClient.ReleaseFIP(s.clientSecret, cluster, project, floatingippool, servicenamespace, servicename, ipaddr); err != nil {
+	if err := s.ipamClient.ReleaseFIP(s.clientSecret, cluster, project, floatingippool, servicenamespace, servicename, ipaddr, floatingipgroup); err != nil {
 		logrus.Errorf("failed to release fip: %s", err)
 		http.Error(w, fmt.Sprintf("failed to release fip: %s", err), http.StatusInternalServerError)
 		return
 	}
 
+	time.Sleep(1 * time.Second)
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
@@ -368,7 +372,8 @@ const fipListTemplate = `
             <th>Service Namespace</th>
             <th>Service Name</th>
             <th>IP Address</th>
-            <th>Actions</th>
+            <th>FloatingIP Group</th>
+			<th>Actions</th>
         </tr>
         {{range .FloatingIPs}}
         <tr>
@@ -377,15 +382,17 @@ const fipListTemplate = `
             <td>{{.ServiceNamespace}}</td>
             <td>{{.ServiceName}}</td>
             <td>{{.IPAddress}}</td>
+            <td>{{.FloatingIPGroup}}</td>
             <td>
                 <form action="/release" method="post" style="display:inline;">
                     <input type="hidden" name="project" value="{{.Project}}">
-					<input type="hidden" name="cluster" value="{{.Cluster}}">
-					<input type="hidden" name="floatingippool" value="{{.FloatingIPPool}}">
-					<input type="hidden" name="servicenamespace" value="{{.ServiceNamespace}}">
-					<input type="hidden" name="servicename" value="{{.ServiceName}}">
+    	            <input type="hidden" name="cluster" value="{{.Cluster}}">
+    	            <input type="hidden" name="floatingippool" value="{{.FloatingIPPool}}">
+    	            <input type="hidden" name="servicenamespace" value="{{.ServiceNamespace}}">
+    	            <input type="hidden" name="servicename" value="{{.ServiceName}}">
                     <input type="hidden" name="ipaddr" value="{{.IPAddress}}">
-                    <button type="submit" {{if eq .Cluster "Unassigned"}}disabled{{end}} onclick="return confirm('Are you sure you want to release FloatingIP {{.IPAddress}} from cluster {{.Cluster}}?');">Release from cluster</button>
+    	            <input type="hidden" name="floatingipgroup" value="{{.FloatingIPGroup}}">
+					<button type="submit" {{if eq .Cluster "Unassigned"}}disabled{{end}} onclick="return confirm('Are you sure you want to release FloatingIP {{.IPAddress}} from cluster {{.Cluster}}?');">Release from cluster</button>
                 </form>
                 <form action="/remove" method="post" style="display:inline;">
                     <input type="hidden" name="project" value="{{.Project}}">

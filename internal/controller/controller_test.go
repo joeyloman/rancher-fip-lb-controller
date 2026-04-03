@@ -16,16 +16,16 @@ import (
 
 // MockIPAMClient is a mock of the IPAM client
 type MockIPAMClient struct {
-	RequestFIPFunc func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) (string, string, error)
-	ReleaseFIPFunc func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) error
+	RequestFIPFunc func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) (string, string, string, error)
+	ReleaseFIPFunc func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) error
 }
 
-func (m *MockIPAMClient) RequestFIP(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) (string, string, error) {
-	return m.RequestFIPFunc(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr)
+func (m *MockIPAMClient) RequestFIP(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) (string, string, string, error) {
+	return m.RequestFIPFunc(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup)
 }
 
-func (m *MockIPAMClient) ReleaseFIP(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) error {
-	return m.ReleaseFIPFunc(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr)
+func (m *MockIPAMClient) ReleaseFIP(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) error {
+	return m.ReleaseFIPFunc(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup)
 }
 
 // MockMetalLBClient is a mock of the MetalLB client
@@ -35,10 +35,16 @@ type MockMetalLBClient struct {
 	DeleteIPAddressPoolFunc   func(ctx context.Context, name, namespace string) error
 	DeleteL2AdvertisementFunc func(ctx context.Context, name, namespace string) error
 	GetIPAddressPoolsFunc     func(ctx context.Context, namespace string) ([]v1beta1.IPAddressPool, error)
+	GetIPAddressPoolFunc      func(ctx context.Context, name, namespace string) (*v1beta1.IPAddressPool, error)
+	UpdateIPAddressPoolFunc   func(ctx context.Context, pool *v1beta1.IPAddressPool) error
 }
 
 func (m *MockMetalLBClient) GetIPAddressPools(ctx context.Context, namespace string) ([]v1beta1.IPAddressPool, error) {
 	return m.GetIPAddressPoolsFunc(ctx, namespace)
+}
+
+func (m *MockMetalLBClient) GetIPAddressPool(ctx context.Context, name, namespace string) (*v1beta1.IPAddressPool, error) {
+	return m.GetIPAddressPoolFunc(ctx, name, namespace)
 }
 
 func (m *MockMetalLBClient) CreateIPAddressPool(ctx context.Context, pool *v1beta1.IPAddressPool) error {
@@ -57,14 +63,18 @@ func (m *MockMetalLBClient) DeleteL2Advertisement(ctx context.Context, name, nam
 	return m.DeleteL2AdvertisementFunc(ctx, name, namespace)
 }
 
+func (m *MockMetalLBClient) UpdateIPAddressPool(ctx context.Context, pool *v1beta1.IPAddressPool) error {
+	return m.UpdateIPAddressPoolFunc(ctx, pool)
+}
+
 func TestController_reconcile(t *testing.T) {
 	clientset := fake.NewSimpleClientset()
 	logger := logrus.New()
 	recorder := record.NewFakeRecorder(10)
 
 	mockIPAM := &MockIPAMClient{
-		RequestFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) (string, string, error) {
-			return "1.2.3.4", "1.2.3.4/24", nil
+		RequestFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) (string, string, string, error) {
+			return "1.2.3.4", "1.2.3.4/24", "shared-key", nil
 		},
 	}
 	mockMetalLB := &MockMetalLBClient{
@@ -139,7 +149,7 @@ func TestController_reconcile_delete(t *testing.T) {
 
 	ipamReleased := false
 	mockIPAM := &MockIPAMClient{
-		ReleaseFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) error {
+		ReleaseFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) error {
 			ipamReleased = true
 			return nil
 		},
@@ -231,6 +241,219 @@ func TestController_reconcile_delete(t *testing.T) {
 	assert.NotContains(t, updatedSvc.ObjectMeta.Finalizers, finalizerName)
 }
 
+func TestController_reconcile_delete_with_shared_floatingip_group(t *testing.T) {
+	clientset := fake.NewSimpleClientset()
+	logger := logrus.New()
+	recorder := record.NewFakeRecorder(10)
+
+	ipamReleased := false
+	mockIPAM := &MockIPAMClient{
+		ReleaseFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) error {
+			ipamReleased = true
+			return nil
+		},
+	}
+
+	poolDeleted := false
+	adDeleted := false
+	mockMetalLB := &MockMetalLBClient{
+		DeleteIPAddressPoolFunc: func(ctx context.Context, name, namespace string) error {
+			poolDeleted = true
+			return nil
+		},
+		DeleteL2AdvertisementFunc: func(ctx context.Context, name, namespace string) error {
+			adDeleted = true
+			return nil
+		},
+	}
+
+	r := &reconciler{
+		clientset:     clientset,
+		metallbClient: mockMetalLB,
+		ipamClient:    mockIPAM,
+		logger:        logger,
+		recorder:      recorder,
+		appNamespace:  "rancher-fip-manager",
+		caCertData:    nil,
+	}
+
+	// Create a service, namespace, and secret
+	appNs := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "rancher-fip-manager"}}
+	_, err := clientset.CoreV1().Namespaces().Create(context.Background(), appNs, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
+	ns := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-ns", Labels: map[string]string{"field.cattle.io/projectId": "p-12345"}}}
+	_, err = clientset.CoreV1().Namespaces().Create(context.Background(), ns, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
+	secret := &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "rancher-fip-config-p-12345", Namespace: "rancher-fip-manager"},
+		Data: map[string][]byte{
+			"apiUrl":           []byte("http://localhost"),
+			"clientId":         []byte("id"),
+			"clientSecret":     []byte("secret"),
+			"floatingIPPool":   []byte("pool1"),
+			"cluster":          []byte("c-12345"),
+			"project":          []byte("p-12345"),
+			"loadBalancerType": []byte("metallb"),
+		},
+	}
+	_, err = clientset.CoreV1().Secrets("rancher-fip-manager").Create(context.Background(), secret, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
+	cm := &v1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "network-interface-mappings", Namespace: "rancher-fip-manager"},
+		Data:       map[string]string{"pool1": "eth0"},
+	}
+	_, err = clientset.CoreV1().ConfigMaps("rancher-fip-manager").Create(context.Background(), cm, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
+	// Create another service that shares the same floatingIPGroup and IP address
+	now := metav1.Now()
+	otherSvc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "other-svc",
+			Namespace:         "test-ns",
+			DeletionTimestamp: &now,
+			Finalizers:        []string{finalizerName},
+			Annotations: map[string]string{
+				"rancher.k8s.binbash.org/floatingip":       "1.2.3.4",
+				"rancher.k8s.binbash.org/floatingip-group": "shared-group",
+			},
+		},
+		Spec: v1.ServiceSpec{Type: v1.ServiceTypeLoadBalancer},
+		Status: v1.ServiceStatus{
+			LoadBalancer: v1.LoadBalancerStatus{
+				Ingress: []v1.LoadBalancerIngress{{IP: "1.2.3.4"}},
+			},
+		},
+	}
+	_, err = clientset.CoreV1().Services("test-ns").Create(context.Background(), otherSvc, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
+	// Create the service being deleted with the same floatingIPGroup and IP address
+	svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "test-svc",
+			Namespace:         "test-ns",
+			DeletionTimestamp: &now,
+			Finalizers:        []string{finalizerName},
+			Annotations: map[string]string{
+				"rancher.k8s.binbash.org/floatingip":       "1.2.3.4",
+				"rancher.k8s.binbash.org/floatingip-group": "shared-group",
+			},
+		},
+		Spec: v1.ServiceSpec{Type: v1.ServiceTypeLoadBalancer},
+		Status: v1.ServiceStatus{
+			LoadBalancer: v1.LoadBalancerStatus{
+				Ingress: []v1.LoadBalancerIngress{{IP: "1.2.3.4"}},
+			},
+		},
+	}
+	_, err = clientset.CoreV1().Services("test-ns").Create(context.Background(), svc, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
+	err = r.reconcile(svc)
+	assert.NoError(t, err)
+
+	// IPAM FIP should still be released
+	assert.True(t, ipamReleased, "IPAM FIP should be released")
+
+	// IPAddressPool and L2Advertisement should NOT be deleted because another service shares the same floatingIPGroup and IP address
+	assert.False(t, poolDeleted, "IPAddressPool should NOT be deleted when another service shares the same floatingIPGroup and IP address")
+	assert.False(t, adDeleted, "L2Advertisement should NOT be deleted when another service shares the same floatingIPGroup and IP address")
+
+	// Check that the finalizer was removed
+	updatedSvc, err := clientset.CoreV1().Services("test-ns").Get(context.Background(), "test-svc", metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.NotContains(t, updatedSvc.ObjectMeta.Finalizers, finalizerName)
+}
+
+func TestController_reconcile_delete_without_floatingip_annotation(t *testing.T) {
+	clientset := fake.NewSimpleClientset()
+	logger := logrus.New()
+	recorder := record.NewFakeRecorder(10)
+
+	ipamReleased := false
+	mockIPAM := &MockIPAMClient{
+		ReleaseFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) error {
+			ipamReleased = true
+			return nil
+		},
+	}
+
+	poolDeleted := false
+	adDeleted := false
+	mockMetalLB := &MockMetalLBClient{
+		DeleteIPAddressPoolFunc: func(ctx context.Context, name, namespace string) error {
+			poolDeleted = true
+			return nil
+		},
+		DeleteL2AdvertisementFunc: func(ctx context.Context, name, namespace string) error {
+			adDeleted = true
+			return nil
+		},
+	}
+
+	r := &reconciler{
+		clientset:     clientset,
+		metallbClient: mockMetalLB,
+		ipamClient:    mockIPAM,
+		logger:        logger,
+		recorder:      recorder,
+		appNamespace:  "rancher-fip-manager",
+		caCertData:    nil,
+	}
+
+	appNs := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "rancher-fip-manager"}}
+	_, err := clientset.CoreV1().Namespaces().Create(context.Background(), appNs, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
+	ns := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-ns", Labels: map[string]string{"field.cattle.io/projectId": "p-12345"}}}
+	_, err = clientset.CoreV1().Namespaces().Create(context.Background(), ns, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
+	secret := &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "rancher-fip-config-p-12345", Namespace: "rancher-fip-manager"},
+		Data: map[string][]byte{
+			"apiUrl":           []byte("http://localhost"),
+			"clientId":         []byte("id"),
+			"clientSecret":     []byte("secret"),
+			"floatingIPPool":   []byte("pool1"),
+			"cluster":          []byte("c-12345"),
+			"project":          []byte("p-12345"),
+			"loadBalancerType": []byte("metallb"),
+		},
+	}
+	_, err = clientset.CoreV1().Secrets("rancher-fip-manager").Create(context.Background(), secret, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
+	now := metav1.Now()
+	svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "test-svc",
+			Namespace:         "test-ns",
+			DeletionTimestamp: &now,
+			Finalizers:        []string{finalizerName},
+			Annotations:       map[string]string{},
+		},
+		Spec: v1.ServiceSpec{Type: v1.ServiceTypeLoadBalancer},
+	}
+	_, err = clientset.CoreV1().Services("test-ns").Create(context.Background(), svc, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
+	err = r.reconcile(svc)
+	assert.NoError(t, err)
+
+	assert.False(t, ipamReleased, "IPAM FIP should not be released without floatingip annotation")
+	assert.False(t, poolDeleted, "IPAddressPool should not be deleted without floatingip annotation")
+	assert.False(t, adDeleted, "L2Advertisement should not be deleted without floatingip annotation")
+
+	updatedSvc, err := clientset.CoreV1().Services("test-ns").Get(context.Background(), "test-svc", metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.NotContains(t, updatedSvc.ObjectMeta.Finalizers, finalizerName)
+}
+
 func TestController_reconcile_no_secret(t *testing.T) {
 	clientset := fake.NewSimpleClientset()
 	logger := logrus.New()
@@ -281,9 +504,9 @@ func TestController_reconcile_ipam_request_error(t *testing.T) {
 
 	requestCalled := false
 	mockIPAM := &MockIPAMClient{
-		RequestFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) (string, string, error) {
+		RequestFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) (string, string, string, error) {
 			requestCalled = true
-			return "", "", assert.AnError
+			return "", "", "", assert.AnError
 		},
 	}
 	mockMetalLB := &MockMetalLBClient{}
@@ -352,9 +575,9 @@ func TestController_reconcile_ipam_quota_exceeded(t *testing.T) {
 
 	requestCalled := false
 	mockIPAM := &MockIPAMClient{
-		RequestFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) (string, string, error) {
+		RequestFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) (string, string, string, error) {
 			requestCalled = true
-			return "", "", fmt.Errorf("quota exceeded")
+			return "", "", "", fmt.Errorf("quota exceeded")
 		},
 	}
 	mockMetalLB := &MockMetalLBClient{}
@@ -423,7 +646,7 @@ func TestController_reconcile_delete_ipam_release_error(t *testing.T) {
 
 	ipamReleased := false
 	mockIPAM := &MockIPAMClient{
-		ReleaseFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) error {
+		ReleaseFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) error {
 			ipamReleased = true
 			return assert.AnError
 		},
@@ -521,8 +744,8 @@ func TestController_reconcile_get_ip_address_pools(t *testing.T) {
 
 	// Mock IPAM client that returns a successful FIP request
 	mockIPAM := &MockIPAMClient{
-		RequestFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr string) (string, string, error) {
-			return "1.2.3.4", "1.2.3.4/24", nil
+		RequestFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) (string, string, string, error) {
+			return "1.2.3.4", "1.2.3.4/24", "shared-key", nil
 		},
 	}
 
@@ -589,12 +812,12 @@ func TestController_reconcile_get_ip_address_pools(t *testing.T) {
 	secret := &v1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "rancher-fip-config-p-12345", Namespace: "rancher-fip-manager"},
 		Data: map[string][]byte{
-			"apiUrl":          []byte("http://localhost"),
-			"clientId":        []byte("id"),
-			"clientSecret":    []byte("secret"),
-			"floatingIPPool":  []byte("pool1"),
-			"cluster":         []byte("c-12345"),
-			"project":         []byte("p-12345"),
+			"apiUrl":           []byte("http://localhost"),
+			"clientId":         []byte("id"),
+			"clientSecret":     []byte("secret"),
+			"floatingIPPool":   []byte("pool1"),
+			"cluster":          []byte("c-12345"),
+			"project":          []byte("p-12345"),
 			"loadBalancerType": []byte("metallb"),
 		},
 	}

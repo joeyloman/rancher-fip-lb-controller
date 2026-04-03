@@ -90,7 +90,7 @@ func TestRequestFIP(t *testing.T) {
 		},
 	}
 
-	ip, _, err := client.RequestFIP("secret", "cluster", "project", "pool", "ns", "service", "")
+	ip, _, _, err := client.RequestFIP("secret", "cluster", "project", "pool", "ns", "service", "", "default")
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)
 	}
@@ -111,7 +111,7 @@ func TestRequestFIPFailures(t *testing.T) {
 	client1.httpClient.Transport = &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
-	_, _, err := client1.RequestFIP("secret", "cluster", "project", "pool", "ns", "service", "")
+	_, _, _, err := client1.RequestFIP("secret", "cluster", "project", "pool", "ns", "service", "", "default")
 	if err == nil {
 		t.Error("expected an error for token failure, got nil")
 	}
@@ -130,7 +130,7 @@ func TestRequestFIPFailures(t *testing.T) {
 	client2.httpClient.Transport = &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
-	_, _, err = client2.RequestFIP("secret", "cluster", "project", "pool", "ns", "service", "")
+	_, _, _, err = client2.RequestFIP("secret", "cluster", "project", "pool", "ns", "service", "", "default")
 	if err == nil {
 		t.Error("expected an error for non-200 response, got nil")
 	}
@@ -149,7 +149,7 @@ func TestRequestFIPFailures(t *testing.T) {
 	client3.httpClient.Transport = &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
-	_, _, err = client3.RequestFIP("secret", "cluster", "project", "pool", "ns", "service", "")
+	_, _, _, err = client3.RequestFIP("secret", "cluster", "project", "pool", "ns", "service", "", "default")
 	if err == nil {
 		t.Error("expected an error for malformed JSON, got nil")
 	}
@@ -181,7 +181,7 @@ func TestRequestFIPFailures(t *testing.T) {
 	client4.httpClient.Transport = &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
-	_, _, err = client4.RequestFIP("secret", "cluster", "project", "pool", "ns", "service", "")
+	_, _, _, err = client4.RequestFIP("secret", "cluster", "project", "pool", "ns", "service", "", "default")
 	if err == nil {
 		t.Error("expected an error for field mismatch, got nil")
 	}
@@ -210,7 +210,7 @@ func TestReleaseFIP(t *testing.T) {
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
 
-	err := client.ReleaseFIP("secret", "cluster", "project", "pool", "ns", "service", "1.2.3.4")
+	err := client.ReleaseFIP("secret", "cluster", "project", "pool", "ns", "service", "1.2.3.4", "default")
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)
 	}
@@ -228,7 +228,7 @@ func TestReleaseFIPFailures(t *testing.T) {
 	client1.httpClient.Transport = &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
-	err := client1.ReleaseFIP("secret", "cluster", "project", "pool", "ns", "service", "1.2.3.4")
+	err := client1.ReleaseFIP("secret", "cluster", "project", "pool", "ns", "service", "1.2.3.4", "default")
 	if err == nil {
 		t.Error("expected an error for token failure, got nil")
 	}
@@ -247,7 +247,7 @@ func TestReleaseFIPFailures(t *testing.T) {
 	client2.httpClient.Transport = &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
-	err = client2.ReleaseFIP("secret", "cluster", "project", "pool", "ns", "service", "1.2.3.4")
+	err = client2.ReleaseFIP("secret", "cluster", "project", "pool", "ns", "service", "1.2.3.4", "default")
 	if err == nil {
 		t.Error("expected an error for non-200 response, got nil")
 	}
@@ -266,7 +266,7 @@ func TestReleaseFIPFailures(t *testing.T) {
 	client3.httpClient.Transport = &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
-	err = client3.ReleaseFIP("secret", "cluster", "project", "pool", "ns", "service", "1.2.3.4")
+	err = client3.ReleaseFIP("secret", "cluster", "project", "pool", "ns", "service", "1.2.3.4", "default")
 	if err == nil {
 		t.Error("expected an error for status not released, got nil")
 	}

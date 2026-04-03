@@ -68,6 +68,7 @@ func TestHandleRelease(t *testing.T) {
 		case "/auth/token":
 			w.Write([]byte(`{"token":"test-token"}`))
 		case "/fip/release":
+			w.WriteHeader(http.StatusOK)
 			w.Write([]byte(`{"status":"released"}`))
 		default:
 			http.NotFound(w, r)
@@ -83,7 +84,7 @@ func TestHandleRelease(t *testing.T) {
 	clientset := fake.NewSimpleClientset()
 	server := NewServer(ipamClient, clientset, "secret", "cluster", "project", []string{"pool1"}, "testuser", "testpassword")
 
-	formValues := "project=p&cluster=c&floatingippool=f&servicenamespace=s&servicename=s&ipaddr=1.2.3.4"
+	formValues := "project=p&cluster=c&floatingippool=f&servicenamespace=s&servicename=s&ipaddr=1.2.3.4&floatingipgroup=default"
 	req, err := http.NewRequest("POST", "/release", strings.NewReader(formValues))
 	if err != nil {
 		t.Fatal(err)
@@ -95,8 +96,8 @@ func TestHandleRelease(t *testing.T) {
 	handler.ServeHTTP(rr, req)
 
 	if status := rr.Code; status != http.StatusSeeOther {
-		t.Errorf("handler returned wrong status code: got %v want %v",
-			status, http.StatusSeeOther)
+		t.Errorf("handler returned wrong status code: got %v want %v, body: %s",
+			status, http.StatusSeeOther, rr.Body.String())
 	}
 }
 

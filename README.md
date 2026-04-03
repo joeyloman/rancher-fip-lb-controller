@@ -82,9 +82,20 @@ metadata:
     rancher.k8s.binbash.org/static-network: "<floatingIPPool-name>"
 ```
 
+To request a specific floatingIPGroup for a `LoadBalancer` service for multiple port usage on a shared ip, add the following annotation to your service manifest:
+
+```yaml
+metadata:
+  annotations:
+    rancher.k8s.binbash.org/floatingip-group: "<floatingIPGroup-name>"
+```
+
 The controller will add the following annotations and labels to the service after requesting the floating IP:
 
 - Annotation `rancher.k8s.binbash.org/floatingip`: The allocated floating IP address.
+- Annotation `metallb.io/allow-shared-ip`: The shared key for MetalLB to allow sharing the IP with other services.
+- Annotation `purelb.io/service-group`: The PureLB service group name.
+- Annotation `purelb.io/allow-shared-ip`: The shared key for PureLB to allow sharing the IP with other services.
 - Label `rancher.k8s.binbash.org/service`: The name of the service.
 - Label `rancher.k8s.binbash.org/servicenamespace`: The namespace of the service.
 
