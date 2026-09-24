@@ -1,0 +1,19 @@
+{{- if .Values.service.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rancher-fip-lb-controller.fullname" . }}
+  namespace: {{ .Release.Namespace | default "kube-system" }}
+  labels:
+    {{- include "rancher-fip-lb-controller.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "rancher-fip-lb-controller.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.webServicePort | default 8080 }}
+      protocol: TCP
+      targetPort: {{ .Values.service.webServicePort | default 8080 }}
+  sessionAffinity: None
+  type: ClusterIP
+{{- end }}

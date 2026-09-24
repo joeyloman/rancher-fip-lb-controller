@@ -27,7 +27,7 @@ manager: generate
 
 ## Build the docker image
 docker-build: test
-	docker build -f Dockerfile -t ${IMG} .
+	docker build -f build/Dockerfile -t ${IMG} .
 
 ## Push the docker image
 docker-push:
