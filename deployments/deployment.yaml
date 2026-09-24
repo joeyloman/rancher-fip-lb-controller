@@ -145,8 +145,8 @@ spec:
       serviceAccountName: rancher-fip-lb-controller
       containers:
       - name: rancher-fip-lb-controller
-        image: ghcr.io/joeyloman/rancher-fip-lb-controller:latest
-        imagePullPolicy: Always
+        image: ghcr.io/joeyloman/rancher-fip-lb-controller:v0.4.2
+        imagePullPolicy: IfNotPresent
         args:
           - --leader-elect=true
           - --lease-lock-name=rancher-fip-lb-controller-lock
