@@ -1,6 +1,11 @@
 apiVersion: v2
 name: rancher-fip-lb-controller
-description: A Helm chart for Kubernetes
+description: Helm chart for the rancher-fip load balancer controller (MetalLB/PureLB)
+home: https://github.com/joeyloman/rancher-fip-lb-controller
+keywords:
+  - metallb
+  - purelb
+  - fip
 
 # A chart can be either an 'application' or a 'library' chart.
 #

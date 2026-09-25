@@ -1,0 +1,59 @@
+name: Package and push Helm chart to GHCR
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'deployments/charts/rancher-fip-lb-controller/Chart.yaml'
+
+env:
+  REGISTRY: ghcr.io
+  CHART_PATH: deployments/charts/rancher-fip-lb-controller
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  package-chart:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up helm
+        run: |
+          curl -fsSL -o /tmp/get-helm-3 https://raw.githubusercontent.com/helm/helm/v3.16.3/scripts/get-helm-3
+          bash /tmp/get-helm-3 --version v3.16.3
+          helm version --short
+
+      - name: Log in to the Container registry
+        run: |
+          helm registry login $REGISTRY \
+            --username ${{ github.actor }} \
+            --password ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check if chart version already published
+        id: version-check
+        run: |
+          CHART_VERSION=$(sed -nE 's/^version:[[:space:]]*"?([^"]+)"?$/\1/p' $CHART_PATH/Chart.yaml | head -n1)
+          if [ -z "$CHART_VERSION" ]; then
+            echo "::error::could not parse chart version from Chart.yaml"
+            exit 1
+          fi
+          echo "version=$CHART_VERSION" >> "$GITHUB_OUTPUT"
+
+          if helm pull oci://$REGISTRY/joeyloman/charts/rancher-fip-lb-controller \
+               --version $CHART_VERSION -d /tmp > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package and push chart to GHCR
+        if: steps.version-check.outputs.exists == 'false'
+        run: |
+          helm package $CHART_PATH
+          helm push rancher-fip-lb-controller-*.tgz oci://$REGISTRY/joeyloman/charts
