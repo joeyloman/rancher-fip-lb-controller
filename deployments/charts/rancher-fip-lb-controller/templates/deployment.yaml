@@ -58,11 +58,47 @@ spec:
             - --lease-lock-name={{ include "rancher-fip-lb-controller.fullname" . }}-lock
             - --lease-lock-namespace={{ .Release.Namespace | default "kube-system" }}
             - --app-namespace={{ .Release.Namespace | default "kube-system" }}
-          {{- with .Values.env }}
+            # The UI port is templated so the container, its Service and the
+            # --http-server-port flag cannot drift apart.
+            - --http-server-port={{ .Values.service.webServicePort | default 8080 }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.webServicePort | default 8080 }}
+              protocol: TCP
+            - name: health
+              containerPort: 8081
+              protocol: TCP
           env:
+            # Used to label this pod as the UI leader so the Service selects
+            # only the replica that can act on the cluster.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          {{- with .Values.env }}
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           terminationMessagePath: /dev/termination-log

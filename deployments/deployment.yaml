@@ -9,12 +9,12 @@ kind: ClusterRole
 metadata:
   name: rancher-fip-lb-controller
 rules:
+# Secrets and ConfigMaps are read only in --app-namespace (rancher-fip-manager);
+# that access is granted by the namespaced Role below, not here.
 - apiGroups:
   - ""
   resources:
   - namespaces
-  - secrets
-  - configmaps
   verbs:
   - get
   - list
@@ -61,6 +61,8 @@ rules:
   - list
   - watch
   - create
+  - update
+  - patch
   - delete
 - apiGroups:
   - purelb.io
@@ -72,6 +74,8 @@ rules:
   - list
   - watch
   - create
+  - update
+  - patch
   - delete
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -103,6 +107,19 @@ rules:
   - get
   - list
   - create
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - get
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - patch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -151,6 +168,38 @@ spec:
           - --leader-elect=true
           - --lease-lock-name=rancher-fip-lb-controller-lock
           - --lease-lock-namespace=rancher-fip-manager
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        - name: health
+          containerPort: 8081
+          protocol: TCP
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: health
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: health
+          initialDelaySeconds: 2
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
       dnsPolicy: ClusterFirst
       restartPolicy: Always
       schedulerName: default-scheduler

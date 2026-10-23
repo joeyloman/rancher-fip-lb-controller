@@ -2,13 +2,16 @@ package ipam
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -61,41 +64,107 @@ type FIPListRequest struct {
 	ClientSecret string `json:"clientsecret"`
 }
 
-// NewClient creates a new IPAM client.
+const (
+	// tokenTimeout bounds authentication calls, which are cheap and must not
+	// hold a reconcile worker for long.
+	tokenTimeout = 10 * time.Second
+
+	// requestTimeout must exceed the IPAM manager's worst-case request
+	// duration (MaxRequestDuration: 30s allocation wait + 10s cleanup).
+	// Aborting earlier cancels the manager's allocation watch mid-write,
+	// which triggers retry churn and can leave a second FloatingIP behind.
+	requestTimeout = 60 * time.Second
+)
+
+// CAStore holds the CA bundle used to verify the IPAM manager. Update replaces
+// the bundle atomically and is safe to call while requests are in flight, so a
+// rotated cacerts Secret takes effect on the next TLS handshake without
+// restarting the controller.
+type CAStore struct {
+	pool atomic.Pointer[x509.CertPool]
+}
+
+// NewCAStore parses a PEM bundle. Empty data means the system roots are used.
+// An invalid bundle is rejected instead of silently leaving an empty pool that
+// only fails later during the TLS handshake.
+func NewCAStore(caCertData []byte) (*CAStore, error) {
+	store := &CAStore{}
+	if err := store.Update(caCertData); err != nil {
+		return nil, err
+	}
+	return store, nil
+}
+
+// Update replaces the CA bundle. On error the previous bundle stays in effect.
+func (s *CAStore) Update(caCertData []byte) error {
+	if len(caCertData) == 0 {
+		s.pool.Store(nil)
+		return nil
+	}
+
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caCertData) {
+		return fmt.Errorf("CA bundle contains no valid PEM certificate")
+	}
+	s.pool.Store(pool)
+	return nil
+}
+
+// Pool returns the current bundle, or nil when the system roots are used.
+func (s *CAStore) Pool() *x509.CertPool {
+	if s == nil {
+		return nil
+	}
+	return s.pool.Load()
+}
+
+// NewClient creates a new IPAM client that verifies the manager with
+// caCertData.
 func NewClient(apiURL string, clientID string, caCertData []byte) (*Client, error) {
+	store, err := NewCAStore(caCertData)
+	if err != nil {
+		return nil, err
+	}
+	return NewClientWithCA(apiURL, clientID, store)
+}
+
+// NewClientWithCA creates a client that reads its trusted CA bundle from store
+// on every TLS handshake. A nil store means the system roots.
+func NewClientWithCA(apiURL string, clientID string, store *CAStore) (*Client, error) {
 	if apiURL == "" {
 		return nil, fmt.Errorf("IPAM API URL is not configured")
 	}
 
-	var client *http.Client
-	if len(caCertData) > 0 {
-		// Create a new HTTP client with the provided CA certificate.
-		caCertPool := x509.NewCertPool()
-		caCertPool.AppendCertsFromPEM(caCertData)
-		client = &http.Client{
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{
-					RootCAs: caCertPool,
-				},
-			},
-			Timeout: 10 * time.Second,
-		}
-	} else {
-		// Create a new HTTP client without a custom CA certificate.
-		client = &http.Client{
-			Timeout: 10 * time.Second,
-		}
+	// The trusted pool is looked up per connection rather than baked into a
+	// tls.Config, so CA rotation needs no client rebuild. Per-call deadlines
+	// are applied in do; the client itself has no global timeout so token and
+	// allocation requests can use different budgets.
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialer := &tls.Dialer{Config: &tls.Config{RootCAs: store.Pool()}}
+			return dialer.DialContext(ctx, network, addr)
+		},
 	}
 
 	return &Client{
-		httpClient: client,
+		httpClient: &http.Client{Transport: transport},
 		apiURL:     apiURL,
 		clientID:   clientID,
 	}, nil
 }
 
+// do issues req with a per-call deadline. The client is copied so the shared
+// Transport (and its connection pool) is reused while the timeout applies only
+// to this request, including reading the response body.
+func (c *Client) do(req *http.Request, timeout time.Duration) (*http.Response, error) {
+	client := *c.httpClient
+	client.Timeout = timeout
+	return client.Do(req)
+}
+
 // getToken gets a JWT from the IPAM API
-func (c *Client) getToken() (string, error) {
+func (c *Client) getToken(ctx context.Context) (string, error) {
 	reqBody := map[string]string{
 		"clientID": c.clientID,
 	}
@@ -105,13 +174,13 @@ func (c *Client) getToken() (string, error) {
 	}
 
 	url := fmt.Sprintf("%s/auth/token", c.apiURL)
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return "", fmt.Errorf("request error: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req, tokenTimeout)
 	if err != nil {
 		return "", fmt.Errorf("client error: %w", err)
 	}
@@ -137,8 +206,8 @@ func (c *Client) getToken() (string, error) {
 }
 
 // RequestFIP requests a floating IP address from the IPAM API.
-func (c *Client) RequestFIP(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) (string, string, string, error) {
-	token, err := c.getToken()
+func (c *Client) RequestFIP(ctx context.Context, clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) (string, string, string, error) {
+	token, err := c.getToken(ctx)
 	if err != nil {
 		return "", "", "", fmt.Errorf("failed to get token for FIP request: %w", err)
 	}
@@ -161,14 +230,14 @@ func (c *Client) RequestFIP(clientSecret, cluster, project, floatingIPPool, serv
 	}
 
 	url := fmt.Sprintf("%s/fip/request", c.apiURL)
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return "", "", "", fmt.Errorf("failed to create FIP request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req, requestTimeout)
 	if err != nil {
 		return "", "", "", fmt.Errorf("failed to request FIP: %w", err)
 	}
@@ -238,8 +307,8 @@ func (c *Client) RequestFIP(clientSecret, cluster, project, floatingIPPool, serv
 }
 
 // ReleaseFIP releases a floating IP address via the IPAM API.
-func (c *Client) ReleaseFIP(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) error {
-	token, err := c.getToken()
+func (c *Client) ReleaseFIP(ctx context.Context, clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) error {
+	token, err := c.getToken(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get token for FIP release: %w", err)
 	}
@@ -262,18 +331,27 @@ func (c *Client) ReleaseFIP(clientSecret, cluster, project, floatingIPPool, serv
 	}
 
 	url := fmt.Sprintf("%s/fip/release", c.apiURL)
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return fmt.Errorf("failed to create FIP release request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req, requestTimeout)
 	if err != nil {
 		return fmt.Errorf("failed to release FIP: %w", err)
 	}
 	defer resp.Body.Close()
+
+	// Release means "ensure absent", not "delete". Once the manager has
+	// processed a release it drops the service and cluster labels, so a retry
+	// (after a crash, a failed annotation update, or a failed finalizer
+	// update) lists no matching FloatingIP and answers 404. Treating that as
+	// an error would leave the Service stuck in Terminating forever.
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+		return nil
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("failed to release FIP: status code %d", resp.StatusCode)
@@ -292,10 +370,6 @@ func (c *Client) ReleaseFIP(clientSecret, cluster, project, floatingIPPool, serv
 		return fmt.Errorf("failed to unmarshal FIP release response: %w", err)
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("failed to release FIP: status code %d", resp.StatusCode)
-	}
-
 	if fipResponse.Status != "released" {
 		return fmt.Errorf("failed to release FIP: status %s", fipResponse.Status)
 	}
@@ -304,8 +378,8 @@ func (c *Client) ReleaseFIP(clientSecret, cluster, project, floatingIPPool, serv
 }
 
 // ListFIPs gets a list of all floating IPs from the IPAM API.
-func (c *Client) ListFIPs(clientSecret, cluster, project, floatingIPPool string) (*FIPListResponse, error) {
-	token, err := c.getToken()
+func (c *Client) ListFIPs(ctx context.Context, clientSecret, cluster, project, floatingIPPool string) (*FIPListResponse, error) {
+	token, err := c.getToken(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get token for FIP list request: %w", err)
 	}
@@ -323,14 +397,14 @@ func (c *Client) ListFIPs(clientSecret, cluster, project, floatingIPPool string)
 	}
 
 	url := fmt.Sprintf("%s/fip/list", c.apiURL)
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create FIP list request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req, requestTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get FloatingIP list: %w", err)
 	}
@@ -348,8 +422,8 @@ func (c *Client) ListFIPs(clientSecret, cluster, project, floatingIPPool string)
 // DeleteFIP deletes a floating IP from the IPAM API.
 // Note: The user requested a DELETE http method, but to be consistent with the other functions
 // in this client which send a body, we are using POST here. The endpoint is assumed to be /fip-delete.
-func (c *Client) DeleteFIP(clientSecret, project, ipaddr string) error {
-	token, err := c.getToken()
+func (c *Client) DeleteFIP(ctx context.Context, clientSecret, project, ipaddr string) error {
+	token, err := c.getToken(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get token for FIP delete request: %w", err)
 	}
@@ -365,14 +439,14 @@ func (c *Client) DeleteFIP(clientSecret, project, ipaddr string) error {
 	}
 
 	url := fmt.Sprintf("%s/fip/delete", c.apiURL)
-	req, err := http.NewRequest("DELETE", url, bytes.NewBuffer(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, "DELETE", url, bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return fmt.Errorf("failed to create FIP delete request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req, requestTimeout)
 	if err != nil {
 		return fmt.Errorf("failed to delete ip address: %w", err)
 	}

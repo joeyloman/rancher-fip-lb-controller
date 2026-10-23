@@ -5,12 +5,12 @@ metadata:
   labels:
     {{- include "rancher-fip-lb-controller.labels" . | nindent 4 }}
 rules:
+# Secrets and ConfigMaps are read only in --app-namespace ({{ .Release.Namespace }});
+# that access is granted by the namespaced Role, not here.
 - apiGroups:
   - ""
   resources:
   - namespaces
-  - secrets
-  - configmaps
   verbs:
   - get
   - list
@@ -57,6 +57,8 @@ rules:
   - list
   - watch
   - create
+  - update
+  - patch
   - delete
 - apiGroups:
   - purelb.io
@@ -68,4 +70,6 @@ rules:
   - list
   - watch
   - create
+  - update
+  - patch
   - delete

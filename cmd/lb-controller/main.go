@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -20,11 +22,37 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
+)
+
+const (
+	// leaderLabelKey marks the pod that serves the HTTP management UI. The
+	// chart's Service selects on it so UI traffic only reaches the replica
+	// that can act on the cluster.
+	leaderLabelKey = "rancher-fip-lb-controller/leader"
+
+	// uiStartupTimeout bounds how long a new leader waits for the management
+	// UI listener before it stops advertising itself.
+	uiStartupTimeout = 30 * time.Second
+
+	// leaderDrainTimeout bounds how long OnStoppedLeading waits for the
+	// controller's own drain (20s grace plus 5s abort). Together with the 5s
+	// label removal it stays within the pod's 30s termination grace period.
+	leaderDrainTimeout = 25 * time.Second
+
+	// caSecretName is the Secret in the app namespace holding the CA bundle
+	// used to verify the IPAM manager.
+	caSecretName = "cacerts"
+
+	// caReloadInterval bounds how long a rotated CA bundle takes to reach the
+	// running clients. Rotation must not require a restart.
+	caReloadInterval = time.Minute
 )
 
 var (
@@ -37,6 +65,8 @@ var (
 	logLevel           string
 	httpServerEnabled  bool
 	httpServerPort     int
+	healthPort         int
+	workers            int
 )
 
 func main() {
@@ -54,7 +84,13 @@ func main() {
 	flag.StringVar(&logLevel, "log-level", "info", "The level of logging (e.g. debug, info, warn, error).")
 	flag.BoolVar(&httpServerEnabled, "enable-http-server", true, "Enable the HTTP server for FIP management.")
 	flag.IntVar(&httpServerPort, "http-server-port", 8080, "The port of the HTTP server listening for FIP management requests.")
+	flag.IntVar(&healthPort, "health-port", 8081, "The port of the health and readiness probe server.")
+	flag.IntVar(&workers, "workers", 4, "Number of concurrent Service reconcile workers. One worker serializes every allocation behind a slow reconcile.")
 	flag.Parse()
+
+	if workers < 1 {
+		logrus.Fatalf("--workers must be at least 1, got %d", workers)
+	}
 
 	level, err := logrus.ParseLevel(logLevel)
 	if err != nil {
@@ -94,17 +130,36 @@ func main() {
 		logrus.Fatalf("Failed to create Kubernetes clientset: %v", clientsetErr)
 	}
 
-	// Read the CA certificate from the secret
-	var caCertData []byte
-	caCert, err := clientset.CoreV1().Secrets(appNamespace).Get(ctx, "cacerts", metav1.GetOptions{})
-	if err != nil {
-		if !errors.IsNotFound(err) {
-			logrus.Fatalf("Failed to get cacerts secret: %v", err)
+	// Health probes must be available on every replica, independently of
+	// leader election and of whether the management UI is configured.
+	go func() {
+		if err := http.ServeHealth(ctx, healthPort); err != nil {
+			logrus.Errorf("health server stopped: %s", err)
 		}
-		logrus.Infof("cacerts secret not found, continuing without custom CA")
+	}()
+
+	// Read the CA certificate from the secret. The bundle is reloaded in the
+	// background, so a transient API error here must not take the process
+	// down: TLS calls fail until the Secret becomes readable.
+	var caCertData []byte
+	caCert, err := clientset.CoreV1().Secrets(appNamespace).Get(ctx, caSecretName, metav1.GetOptions{})
+	if err != nil {
+		if errors.IsNotFound(err) {
+			logrus.Infof("cacerts secret not found, continuing without custom CA")
+		} else {
+			logrus.Warnf("failed to get cacerts secret, retrying in the background: %v", err)
+		}
 	} else {
 		caCertData = caCert.Data["ca.crt"]
 	}
+
+	// An unparsable bundle is a configuration error, not a transient one:
+	// fail fast with a precise message instead of failing every handshake.
+	caStore, err := ipam.NewCAStore(caCertData)
+	if err != nil {
+		logrus.Fatalf("Invalid CA bundle in cacerts secret: %v", err)
+	}
+	go watchCACert(ctx, clientset, appNamespace, caStore)
 
 	metallbClient, metallbErr := metallb.NewClient(config)
 	if metallbErr != nil {
@@ -116,8 +171,40 @@ func main() {
 		logrus.Fatalf("Failed to create PureLB client: %v", purelbErr)
 	}
 
+	// The HTTP UI runs on every replica. Mutating requests are gated on
+	// leadership and the Service selects the leader pod by label, so the UI
+	// stays reachable across leader changes instead of being bound to the
+	// pod that happened to win the first election.
+	var leaderReady atomic.Bool
+	isLeader := func() bool { return leaderReady.Load() }
+
+	var uiReady <-chan struct{}
+	if httpServerEnabled {
+		ready, err := startHttpServer(ctx, clientset, appNamespace, caStore, httpServerPort, isLeader)
+		if err != nil {
+			logrus.Errorf("failed to start HTTP server: %s", err)
+		}
+		uiReady = ready
+	}
+
+	podName := os.Getenv("POD_NAME")
+	podNamespace := os.Getenv("POD_NAMESPACE")
+	if podNamespace == "" {
+		podNamespace = appNamespace
+	}
+
+	// A previous container in this pod may have left the leader label behind;
+	// do not advertise a UI that is not serving yet.
+	removeLeaderLabel(ctx, clientset, podName, podNamespace)
+
+	publishLeader := func(ctx context.Context) {
+		go markLeaderPod(ctx, clientset, podName, podNamespace, uiReady)
+	}
+
 	if !leaderElect {
-		run(ctx, clientset, metallbClient, purelbClient, appNamespace, caCertData, httpServerPort)
+		leaderReady.Store(true)
+		publishLeader(ctx)
+		run(ctx, clientset, metallbClient, purelbClient, appNamespace, caStore)
 		logrus.Info("Controller finished")
 		return
 	}
@@ -135,6 +222,11 @@ func main() {
 		},
 	}
 
+	// controllerStarted and controllerDone let OnStoppedLeading wait for the
+	// leader's controller to drain instead of exiting mid-reconcile.
+	controllerStarted := make(chan struct{})
+	controllerDone := make(chan struct{})
+
 	leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
 		Lock:            lock,
 		ReleaseOnCancel: true,
@@ -143,9 +235,42 @@ func main() {
 		RetryPeriod:     2 * time.Second,
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
-				run(ctx, clientset, metallbClient, purelbClient, appNamespace, caCertData, httpServerPort)
+				close(controllerStarted)
+				leaderReady.Store(true)
+				publishLeader(ctx)
+				run(ctx, clientset, metallbClient, purelbClient, appNamespace, caStore)
+				close(controllerDone)
 			},
 			OnStoppedLeading: func() {
+				leaderReady.Store(false)
+				// Best-effort: stop routing UI traffic to this replica. Run it
+				// concurrently with the drain so the 5s bound does not add to
+				// the drain wait and push the process past the pod's 30s
+				// termination grace period.
+				unlabelDone := make(chan struct{})
+				go func() {
+					defer close(unlabelDone)
+					unlabelCtx, unlabelCancel := context.WithTimeout(context.Background(), 5*time.Second)
+					removeLeaderLabel(unlabelCtx, clientset, podName, podNamespace)
+					unlabelCancel()
+				}()
+
+				// Run drains in-flight reconciles after its context is
+				// canceled; exiting here without waiting would abandon a
+				// reconcile between RequestFIP and the annotation write,
+				// leaking the address on the next start.
+				select {
+				case <-controllerStarted:
+					select {
+					case <-controllerDone:
+					case <-time.After(leaderDrainTimeout):
+						logrus.Warnf("controller did not drain within %s, exiting", leaderDrainTimeout)
+					}
+				default:
+					// The controller never started; there is nothing to drain.
+				}
+				<-unlabelDone
+
 				logrus.Infof("leader lost: %s", id)
 				os.Exit(0)
 			},
@@ -160,31 +285,46 @@ func main() {
 	})
 }
 
-func run(ctx context.Context, clientset *kubernetes.Clientset, metallbClient *metallb.Client, purelbClient *purelb.Client, appNamespace string, caCertData []byte, httpServerPort int) {
+func run(ctx context.Context, clientset *kubernetes.Clientset, metallbClient *metallb.Client, purelbClient *purelb.Client, appNamespace string, caStore *ipam.CAStore) {
 	logrus.Info("Starting rancher-fip-lb-controller")
 
-	if httpServerEnabled {
-		if err := startHttpServer(ctx, clientset, appNamespace, caCertData, httpServerPort); err != nil {
-			logrus.Errorf("failed to start HTTP server: %s", err)
-		}
-	}
-
-	c := controller.New(clientset, metallbClient, purelbClient, appNamespace, caCertData)
-	c.Run(ctx, 1)
+	c := controller.New(clientset, metallbClient, purelbClient, appNamespace, caStore)
+	c.Run(ctx, workers)
 }
 
-func startHttpServer(ctx context.Context, clientset *kubernetes.Clientset, appNamespace string, caCertData []byte, httpServerPort int) error {
+// watchCACert keeps the in-memory CA bundle in sync with the cacerts Secret.
+// Every IPAM client reads the bundle from this store on each TLS handshake, so
+// a rotated certificate is trusted within caReloadInterval and a Secret that
+// was unreadable at startup is picked up as soon as the API server recovers.
+// An invalid bundle is logged and ignored so the last known
+// good bundle stays in effect.
+func watchCACert(ctx context.Context, clientset kubernetes.Interface, appNamespace string, store *ipam.CAStore) {
+	wait.UntilWithContext(ctx, func(ctx context.Context) {
+		caCert, err := clientset.CoreV1().Secrets(appNamespace).Get(ctx, caSecretName, metav1.GetOptions{})
+		if err != nil {
+			if !errors.IsNotFound(err) {
+				logrus.Warnf("failed to reload cacerts secret: %v", err)
+			}
+			return
+		}
+		if err := store.Update(caCert.Data["ca.crt"]); err != nil {
+			logrus.Errorf("ignoring invalid CA bundle in cacerts secret: %v", err)
+		}
+	}, caReloadInterval)
+}
+
+func startHttpServer(ctx context.Context, clientset *kubernetes.Clientset, appNamespace string, caStore *ipam.CAStore, httpServerPort int, isLeader func() bool) (<-chan struct{}, error) {
 	// Only start the HTTP server if the app namespace has a project ID label
 	appNs, err := clientset.CoreV1().Namespaces().Get(ctx, appNamespace, metav1.GetOptions{})
 	if err != nil {
-		return fmt.Errorf("failed to get app namespace %s: %v", appNamespace, err)
+		return nil, fmt.Errorf("failed to get app namespace %s: %v", appNamespace, err)
 	}
 
 	projectId, ok := appNs.Labels["rancher.k8s.binbash.org/project-name"]
 	if !ok {
 		// This is not an error, it just means that the HTTP server will not be started because it's not part of a project (bare-metal cluster)
 		logrus.Warnf("namespace %s does not have a project ID label 'rancher.k8s.binbash.org/project-name', aborting HTTP server", appNamespace)
-		return nil
+		return nil, nil
 	}
 
 	// generate username and password for http basic auth
@@ -196,11 +336,11 @@ func startHttpServer(ctx context.Context, clientset *kubernetes.Clientset, appNa
 
 			username, err := util.GenerateRandomString(10)
 			if err != nil {
-				return fmt.Errorf("failed to generate random string for username: %s", err)
+				return nil, fmt.Errorf("failed to generate random string for username: %s", err)
 			}
 			password, err := util.GenerateRandomString(32)
 			if err != nil {
-				return fmt.Errorf("failed to generate random string for password: %s", err)
+				return nil, fmt.Errorf("failed to generate random string for password: %s", err)
 			}
 
 			httpAuthSecret, err = clientset.CoreV1().Secrets(appNamespace).Create(ctx, &corev1.Secret{
@@ -213,11 +353,15 @@ func startHttpServer(ctx context.Context, clientset *kubernetes.Clientset, appNa
 					"password": password,
 				},
 			}, metav1.CreateOptions{})
+			if errors.IsAlreadyExists(err) {
+				// Another replica created the shared credentials first.
+				httpAuthSecret, err = clientset.CoreV1().Secrets(appNamespace).Get(ctx, httpAuthSecretName, metav1.GetOptions{})
+			}
 			if err != nil {
-				return fmt.Errorf("failed to create http auth secret %s: %s", httpAuthSecretName, err)
+				return nil, fmt.Errorf("failed to create http auth secret %s: %s", httpAuthSecretName, err)
 			}
 		} else {
-			return fmt.Errorf("failed to get http auth secret %s: %s", httpAuthSecretName, err)
+			return nil, fmt.Errorf("failed to get http auth secret %s: %s", httpAuthSecretName, err)
 		}
 	}
 
@@ -227,7 +371,7 @@ func startHttpServer(ctx context.Context, clientset *kubernetes.Clientset, appNa
 	secretName := fmt.Sprintf("rancher-fip-config-%s", projectId)
 	secret, err := clientset.CoreV1().Secrets(appNamespace).Get(ctx, secretName, metav1.GetOptions{})
 	if err != nil {
-		return fmt.Errorf("failed to get secret %s in namespace %s: %v", secretName, appNamespace, err)
+		return nil, fmt.Errorf("failed to get secret %s in namespace %s: %v", secretName, appNamespace, err)
 	}
 
 	ipamAPIURL := string(secret.Data["apiUrl"])
@@ -238,7 +382,7 @@ func startHttpServer(ctx context.Context, clientset *kubernetes.Clientset, appNa
 
 	configMap, err := clientset.CoreV1().ConfigMaps(appNamespace).Get(ctx, "network-interface-mappings", metav1.GetOptions{})
 	if err != nil {
-		return fmt.Errorf("failed to get configmap network-interface-mappings: %w", err)
+		return nil, fmt.Errorf("failed to get configmap network-interface-mappings: %w", err)
 	}
 
 	var floatingIPPools []string
@@ -246,13 +390,78 @@ func startHttpServer(ctx context.Context, clientset *kubernetes.Clientset, appNa
 		floatingIPPools = append(floatingIPPools, pool)
 	}
 
-	ipamClient, err := ipam.NewClient(ipamAPIURL, ipamClientID, caCertData)
+	ipamClient, err := ipam.NewClientWithCA(ipamAPIURL, ipamClientID, caStore)
 	if err != nil {
-		logrus.Fatalf("failed to create ipam client: %s", err)
+		return nil, fmt.Errorf("failed to create ipam client: %w", err)
 	}
 
-	httpServer := http.NewServer(ipamClient, clientset, clientSecret, cluster, project, floatingIPPools, username, password)
-	go httpServer.Start(httpServerPort)
+	httpServer, err := http.NewServer(ipamClient, clientset, clientSecret, cluster, project, floatingIPPools, username, password, isLeader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create http server: %w", err)
+	}
 
-	return nil
+	go func() {
+		if err := httpServer.Start(ctx, httpServerPort); err != nil {
+			logrus.Errorf("HTTP server stopped: %s", err)
+		}
+	}()
+
+	return httpServer.Ready(), nil
+}
+
+// markLeaderPod labels this pod as the HTTP UI leader once the UI listener is
+// accepting connections. The chart's Service selects on that label, so it must
+// not be set before the port is open.
+func markLeaderPod(ctx context.Context, clientset kubernetes.Interface, podName, podNamespace string, uiReady <-chan struct{}) {
+	if podName == "" {
+		logrus.Warn("POD_NAME is not set; the HTTP UI Service will not select this pod")
+		return
+	}
+	if uiReady == nil {
+		logrus.Warn("HTTP server is not running; not advertising this pod as the UI leader")
+		return
+	}
+
+	select {
+	case <-uiReady:
+	case <-time.After(uiStartupTimeout):
+		logrus.Warnf("HTTP server did not start within %s; not advertising pod %s/%s as the UI leader", uiStartupTimeout, podNamespace, podName)
+		return
+	case <-ctx.Done():
+		return
+	}
+
+	if err := patchLeaderLabel(ctx, clientset, podName, podNamespace, true); err != nil {
+		logrus.Errorf("failed to mark pod %s/%s as UI leader: %s", podNamespace, podName, err)
+		return
+	}
+	logrus.Infof("pod %s/%s marked as UI leader", podNamespace, podName)
+}
+
+// removeLeaderLabel clears the UI leader label, best effort.
+func removeLeaderLabel(ctx context.Context, clientset kubernetes.Interface, podName, podNamespace string) {
+	if podName == "" {
+		return
+	}
+	if err := patchLeaderLabel(ctx, clientset, podName, podNamespace, false); err != nil {
+		logrus.Debugf("could not remove UI leader label from pod %s/%s: %s", podNamespace, podName, err)
+	}
+}
+
+func patchLeaderLabel(ctx context.Context, clientset kubernetes.Interface, podName, podNamespace string, leader bool) error {
+	// A nil value removes the label; a string is required for a label value.
+	var value any
+	if leader {
+		value = "true"
+	}
+	patch, err := json.Marshal(map[string]any{
+		"metadata": map[string]any{
+			"labels": map[string]any{leaderLabelKey: value},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	_, err = clientset.CoreV1().Pods(podNamespace).Patch(ctx, podName, types.MergePatchType, patch, metav1.PatchOptions{})
+	return err
 }

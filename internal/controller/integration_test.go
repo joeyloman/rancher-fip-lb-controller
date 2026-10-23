@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -10,12 +11,14 @@ import (
 	"github.com/joeyloman/rancher-fip-lb-controller/pkg/metallb"
 	"github.com/joeyloman/rancher-fip-lb-controller/pkg/purelb"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.universe.tf/metallb/api/v1beta1"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 )
@@ -24,16 +27,57 @@ func contains(s, substr string) bool {
 	return strings.Contains(s, substr)
 }
 
-func TestController_Integration_MetalLB(t *testing.T) {
+// envtestBinaryPath resolves an envtest control-plane binary the same way
+// envtest does: TEST_ASSET_<NAME>, then KUBEBUILDER_ASSETS, then the default
+// install directory.
+func envtestBinaryPath(binary string) string {
+	envVar := "TEST_ASSET_" + strings.ToUpper(strings.ReplaceAll(binary, "-", "_"))
+	if path, ok := os.LookupEnv(envVar); ok {
+		return path
+	}
+	if dir, ok := os.LookupEnv("KUBEBUILDER_ASSETS"); ok {
+		return filepath.Join(dir, binary)
+	}
+	return filepath.Join("/usr/local/kubebuilder/bin", binary)
+}
+
+func envtestBinariesAvailable() bool {
+	for _, binary := range []string{"kube-apiserver", "etcd"} {
+		info, err := os.Stat(envtestBinaryPath(binary))
+		if err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// startEnvtest starts a control plane for the test, skipping it when the
+// envtest binaries are not installed.
+func startEnvtest(t *testing.T) *rest.Config {
+	t.Helper()
+
+	if !envtestBinariesAvailable() {
+		t.Skip("envtest binaries not found; set KUBEBUILDER_ASSETS to run the integration tests")
+	}
+
 	testEnv := &envtest.Environment{
 		CRDDirectoryPaths: []string{filepath.Join("..", "..", "config", "crd")},
 	}
-
 	cfg, err := testEnv.Start()
-	assert.NoError(t, err)
-	defer testEnv.Stop()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if err := testEnv.Stop(); err != nil {
+			t.Logf("stopping envtest: %v", err)
+		}
+	})
 
-	err = v1beta1.AddToScheme(scheme.Scheme)
+	return cfg
+}
+
+func TestController_Integration_MetalLB(t *testing.T) {
+	cfg := startEnvtest(t)
+
+	err := v1beta1.AddToScheme(scheme.Scheme)
 	assert.NoError(t, err)
 
 	k8sClient, err := client.New(cfg, client.Options{Scheme: scheme.Scheme})
@@ -81,14 +125,17 @@ func TestController_Integration_MetalLB(t *testing.T) {
 
 	// In the integration test, we still want to mock the IPAM client
 	mockIPAM := &MockIPAMClient{
-		RequestFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) (string, string, string, error) {
+		RequestFIPFunc: func(ctx context.Context, clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) (string, string, string, error) {
+			if serviceName == "test-svc-ipv6" {
+				return "2001:db8::1", "2001:db8::/64", "shared-key", nil
+			}
 			return "1.2.3.4", "1.2.3.4/24", "shared-key", nil
 		},
-		ReleaseFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) error {
+		ReleaseFIPFunc: func(ctx context.Context, clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) error {
 			return nil
 		},
 	}
-	controller.reconciler.ipamClient = mockIPAM
+	controller.reconciler.ipamClientOverride = mockIPAM
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -144,13 +191,13 @@ func TestController_Integration_MetalLB(t *testing.T) {
 	// Wait for the IPAddressPool and L2Advertisement to be created
 	assert.Eventually(t, func() bool {
 		pool := &v1beta1.IPAddressPool{}
-		err := k8sClient.Get(context.Background(), client.ObjectKey{Name: "rancher-fip-test-ns-test-svc", Namespace: "rancher-fip-manager"}, pool)
+		err := k8sClient.Get(context.Background(), client.ObjectKey{Name: "ip4-1.2.3.4", Namespace: "rancher-fip-manager"}, pool)
 		return err == nil
 	}, 10*time.Second, 1*time.Second)
 
 	assert.Eventually(t, func() bool {
 		ad := &v1beta1.L2Advertisement{}
-		err := k8sClient.Get(context.Background(), client.ObjectKey{Name: "rancher-fip-test-ns-test-svc", Namespace: "rancher-fip-manager"}, ad)
+		err := k8sClient.Get(context.Background(), client.ObjectKey{Name: "ip4-1.2.3.4", Namespace: "rancher-fip-manager"}, ad)
 		return err == nil
 	}, 10*time.Second, 1*time.Second)
 
@@ -161,27 +208,60 @@ func TestController_Integration_MetalLB(t *testing.T) {
 	// Wait for the IPAddressPool and L2Advertisement to be deleted
 	assert.Eventually(t, func() bool {
 		pool := &v1beta1.IPAddressPool{}
-		err := k8sClient.Get(context.Background(), client.ObjectKey{Name: "rancher-fip-test-ns-test-svc", Namespace: "rancher-fip-manager"}, pool)
+		err := k8sClient.Get(context.Background(), client.ObjectKey{Name: "ip4-1.2.3.4", Namespace: "rancher-fip-manager"}, pool)
 		return apierrors.IsNotFound(err)
 	}, 10*time.Second, 1*time.Second)
 
 	assert.Eventually(t, func() bool {
 		ad := &v1beta1.L2Advertisement{}
-		err := k8sClient.Get(context.Background(), client.ObjectKey{Name: "rancher-fip-test-ns-test-svc", Namespace: "rancher-fip-manager"}, ad)
+		err := k8sClient.Get(context.Background(), client.ObjectKey{Name: "ip4-1.2.3.4", Namespace: "rancher-fip-manager"}, ad)
+		return apierrors.IsNotFound(err)
+	}, 10*time.Second, 1*time.Second)
+
+	// IPv6: the pool must contain a single /128, not the /32 the controller
+	// used to emit for every address.
+	ipv6PoolName := "ip6-2001-db8--1"
+	ipv6Svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-svc-ipv6", Namespace: "test-ns"},
+		Spec: v1.ServiceSpec{
+			Type:  v1.ServiceTypeLoadBalancer,
+			Ports: []v1.ServicePort{{Port: 80, Protocol: v1.ProtocolTCP}},
+		},
+	}
+	err = k8sClient.Create(context.Background(), ipv6Svc)
+	assert.NoError(t, err)
+
+	assert.Eventually(t, func() bool {
+		pool := &v1beta1.IPAddressPool{}
+		err := k8sClient.Get(context.Background(), client.ObjectKey{Name: ipv6PoolName, Namespace: "rancher-fip-manager"}, pool)
+		return err == nil
+	}, 10*time.Second, 1*time.Second)
+
+	var ipv6Pool v1beta1.IPAddressPool
+	err = k8sClient.Get(context.Background(), client.ObjectKey{Name: ipv6PoolName, Namespace: "rancher-fip-manager"}, &ipv6Pool)
+	require.NoError(t, err)
+	require.Equal(t, []string{"2001:db8::1/128"}, ipv6Pool.Spec.Addresses)
+
+	assert.Eventually(t, func() bool {
+		ad := &v1beta1.L2Advertisement{}
+		err := k8sClient.Get(context.Background(), client.ObjectKey{Name: ipv6PoolName, Namespace: "rancher-fip-manager"}, ad)
+		return err == nil
+	}, 10*time.Second, 1*time.Second)
+
+	err = k8sClient.Delete(context.Background(), ipv6Svc)
+	assert.NoError(t, err)
+
+	assert.Eventually(t, func() bool {
+		pool := &v1beta1.IPAddressPool{}
+		err := k8sClient.Get(context.Background(), client.ObjectKey{Name: ipv6PoolName, Namespace: "rancher-fip-manager"}, pool)
 		return apierrors.IsNotFound(err)
 	}, 10*time.Second, 1*time.Second)
 }
 
 func TestController_Integration_PureLB(t *testing.T) {
-	testEnv := &envtest.Environment{
-		CRDDirectoryPaths: []string{filepath.Join("..", "..", "config", "crd")},
-	}
+	cfg := startEnvtest(t)
 
-	cfg, err := testEnv.Start()
-	assert.NoError(t, err)
-	defer testEnv.Stop()
-
-	err = purelb.AddToScheme(scheme.Scheme)
+	err := purelb.AddToScheme(scheme.Scheme)
 	assert.NoError(t, err)
 
 	k8sClient, err := client.New(cfg, client.Options{Scheme: scheme.Scheme})
@@ -236,14 +316,14 @@ func TestController_Integration_PureLB(t *testing.T) {
 
 	// In the integration test, we still want to mock the IPAM client
 	mockIPAM := &MockIPAMClient{
-		RequestFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) (string, string, string, error) {
+		RequestFIPFunc: func(ctx context.Context, clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) (string, string, string, error) {
 			return "1.2.3.4", "1.2.3.4/24", "shared-key", nil
 		},
-		ReleaseFIPFunc: func(clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) error {
+		ReleaseFIPFunc: func(ctx context.Context, clientSecret, cluster, project, floatingIPPool, serviceNamespace, serviceName, ipaddr, floatingIPGroup string) error {
 			return nil
 		},
 	}
-	controller.reconciler.ipamClient = mockIPAM
+	controller.reconciler.ipamClientOverride = mockIPAM
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -299,15 +379,15 @@ func TestController_Integration_PureLB(t *testing.T) {
 	// Wait for the ServiceGroup to be created
 	assert.Eventually(t, func() bool {
 		serviceGroup := &purelb.ServiceGroup{}
-		err := k8sClient.Get(context.Background(), client.ObjectKey{Name: "rancher-fip-test-ns-purelb-test-svc-purelb", Namespace: "rancher-fip-manager"}, serviceGroup)
+		err := k8sClient.Get(context.Background(), client.ObjectKey{Name: "ip4-1.2.3.4", Namespace: "rancher-fip-manager"}, serviceGroup)
 		return err == nil
 	}, 10*time.Second, 1*time.Second)
 
 	// Verify the ServiceGroup spec
 	var createdServiceGroup purelb.ServiceGroup
-	err = k8sClient.Get(context.Background(), client.ObjectKey{Name: "rancher-fip-test-ns-purelb-test-svc-purelb", Namespace: "rancher-fip-manager"}, &createdServiceGroup)
-	assert.NoError(t, err)
-	assert.NotNil(t, createdServiceGroup.Spec.Local)
+	err = k8sClient.Get(context.Background(), client.ObjectKey{Name: "ip4-1.2.3.4", Namespace: "rancher-fip-manager"}, &createdServiceGroup)
+	require.NoError(t, err)
+	require.NotNil(t, createdServiceGroup.Spec.Local)
 	assert.Len(t, createdServiceGroup.Spec.Local.V4Pools, 1)
 	assert.Equal(t, "1.2.3.4/32", createdServiceGroup.Spec.Local.V4Pools[0].Pool)
 	assert.Equal(t, "1.2.3.4/24", createdServiceGroup.Spec.Local.V4Pools[0].Subnet)
@@ -320,7 +400,7 @@ func TestController_Integration_PureLB(t *testing.T) {
 	// Wait for the ServiceGroup to be deleted
 	assert.Eventually(t, func() bool {
 		serviceGroup := &purelb.ServiceGroup{}
-		err := k8sClient.Get(context.Background(), client.ObjectKey{Name: "rancher-fip-test-ns-purelb-test-svc-purelb", Namespace: "rancher-fip-manager"}, serviceGroup)
+		err := k8sClient.Get(context.Background(), client.ObjectKey{Name: "ip4-1.2.3.4", Namespace: "rancher-fip-manager"}, serviceGroup)
 		return apierrors.IsNotFound(err)
 	}, 10*time.Second, 1*time.Second)
 }

@@ -93,6 +93,7 @@ metadata:
 The controller will add the following annotations and labels to the service after requesting the floating IP:
 
 - Annotation `rancher.k8s.binbash.org/floatingip`: The allocated floating IP address.
+- Annotation `rancher.k8s.binbash.org/floatingip-project`: The project the address was allocated under. Deletion uses it to release the address, so it stays correct if the namespace's project label changes later.
 - Annotation `metallb.io/allow-shared-ip`: The shared key for MetalLB to allow sharing the IP with other services.
 - Annotation `purelb.io/service-group`: The PureLB service group name.
 - Annotation `purelb.io/allow-shared-ip`: The shared key for PureLB to allow sharing the IP with other services.
@@ -100,6 +101,21 @@ The controller will add the following annotations and labels to the service afte
 - Label `rancher.k8s.binbash.org/servicenamespace`: The namespace of the service.
 
 The controller also adds a finalizer `rancher.k8s.binbash.org/floatingip-cleanup` to the service to ensure proper cleanup of resources when the service is deleted.
+
+## HTTP Management UI
+
+When the app namespace carries the project label, every replica serves the
+management UI on port 8080, but only the elected leader is added to the
+`Service`: the leader labels its own Pod with
+`rancher-fip-lb-controller/leader=true`, and the Service selects on that label.
+Requests that mutate state (`/release`, `/remove`) are refused with `503` on a
+non-leader replica, and the label is cleared when leadership is lost.
+
+Sessions are kept in memory per replica, so a leader change requires logging in
+again.
+
+Liveness (`/healthz`) and readiness (`/readyz`) probes are served on port 8081
+on every replica, including deployments where the UI is not configured.
 
 ## Network Interface Mappings
 
